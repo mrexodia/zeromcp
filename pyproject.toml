@@ -1,0 +1,17 @@
+[project]
+name = "zeromcp"
+version = "0.1.0"
+description = "Zero-dependency MCP server implementation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+license = "MIT"
+
+[project.urls]
+Homepage = "https://github.com/mrexodia/zeromcp"
+Repository = "https://github.com/mrexodia/zeromcp"
+Issues = "https://github.com/mrexodia/zeromcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
