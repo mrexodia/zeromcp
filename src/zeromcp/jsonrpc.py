@@ -3,6 +3,7 @@ import types
 import inspect
 import traceback
 from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
+from types import UnionType
 
 JsonRpcId: TypeAlias = str | int | float | None
 JsonRpcParams: TypeAlias = dict[str, Any] | list[Any] | None
@@ -113,12 +114,12 @@ class JsonRpcRegistry:
                     -32602,
                     f"Invalid params: expected at least {len(required_params)} arguments, got {len(params)}"
                 )
-            if len(params) > len(hints):
+            if len(params) > len(sig.parameters):
                 raise JsonRpcException(
                     -32602,
-                    f"Invalid params: expected at most {len(hints)} arguments, got {len(params)}"
+                    f"Invalid params: expected at most {len(sig.parameters)} arguments, got {len(params)}"
                 )
-            params = dict(zip(hints.keys(), params))
+            params = dict(zip(sig.parameters.keys(), params))
 
         # Validate dict params
         if isinstance(params, dict):
@@ -131,7 +132,7 @@ class JsonRpcRegistry:
                 )
 
             # Check no extra params
-            extra = set(params.keys()) - set(hints.keys())
+            extra = set(params.keys()) - set(sig.parameters.keys())
             if extra:
                 raise JsonRpcException(
                     -32602,
@@ -139,11 +140,14 @@ class JsonRpcRegistry:
                 )
 
             validated_params = {}
-            for param_name, expected_type in hints.items():
-                if param_name not in params:
-                    continue  # Skip optional params not provided
+            for param_name, value in params.items():
+                # If no type hint, pass through without validation
+                if param_name not in hints:
+                    validated_params[param_name] = value
+                    continue
 
-                value = params[param_name]
+                # Has type hint, validate
+                expected_type = hints[param_name]
 
                 # Inline type validation
                 origin = get_origin(expected_type)
@@ -153,13 +157,13 @@ class JsonRpcRegistry:
                 if value is None:
                     if expected_type is not type(None):
                         # Check if None is allowed in a Union
-                        if not (origin is Union and type(None) in args):
+                        if not (origin in (Union, UnionType) and type(None) in args):
                             raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
                     validated_params[param_name] = None
                     continue
 
                 # Handle Union types (int | str, Optional[int], etc.)
-                if origin is Union or (hasattr(types, 'UnionType') and origin is types.UnionType):
+                if origin in (Union, UnionType):
                     type_matched = False
                     for arg_type in args:
                         if arg_type is type(None):
@@ -177,7 +181,7 @@ class JsonRpcRegistry:
                             break
 
                     if not type_matched:
-                        raise JsonRpcException(-32602, f"Invalid params: {param_name} has invalid type")
+                        raise JsonRpcException(-32602, f"Invalid params: {param_name} union does not contain {type(value).__name__}")
                     validated_params[param_name] = value
                     continue
 
@@ -201,6 +205,11 @@ class JsonRpcRegistry:
                     validated_params[param_name] = value
                     continue
 
+                # Handle Any
+                if expected_type is Any:
+                    validated_params[param_name] = value
+                    continue
+
                 # Handle basic types
                 if isinstance(expected_type, type):
                     # Allow int -> float conversion
@@ -214,9 +223,6 @@ class JsonRpcRegistry:
                         )
                     validated_params[param_name] = value
                     continue
-
-                # Fallback for Any or unknown
-                validated_params[param_name] = value
 
             return func(**validated_params)
 

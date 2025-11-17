@@ -5,20 +5,20 @@ import json
 import sys
 import traceback
 import re
-from typing import Optional, Any
+from typing import Optional, Any, TypedDict
 
 from zeromcp.jsonrpc import JsonRpcRegistry
 
 # Create registry and register test methods
 jsonrpc = JsonRpcRegistry()
 
+class Point(TypedDict):
+    x: int
+    y: int
+
 @jsonrpc.method
 def subtract(minuend: int, subtrahend: int) -> int:
     return minuend - subtrahend
-
-@jsonrpc.method
-def sum_array(numbers: list) -> int:
-    return sum(numbers)
 
 @jsonrpc.method
 def update(a: int, b: int, c: int, d: int, e: int) -> str:
@@ -27,14 +27,6 @@ def update(a: int, b: int, c: int, d: int, e: int) -> str:
 @jsonrpc.method
 def foobar() -> str:
     return "bar"
-
-@jsonrpc.method
-def notify_hello(value: int) -> None:
-    pass
-
-@jsonrpc.method
-def notify_sum(a: int, b: int, c: int) -> None:
-    pass
 
 @jsonrpc.method
 def get_data() -> list:
@@ -49,13 +41,32 @@ def process_optional(value: Optional[int]) -> str:
     return f"Got: {value}"
 
 @jsonrpc.method
-def union_test(id: int | str) -> str:
-    return f"ID: {id}"
+def union_test(id: int | str | None | Point) -> str:
+    return f"ID: {id or '<nil>'}"
 
 @jsonrpc.method
 def list_test(items: list[str]) -> int:
     return len(items)
 
+@jsonrpc.method
+def exception():
+    raise Exception("Python exception")
+
+@jsonrpc.method
+def point_pretty(p: Point) -> str:
+    return f"Point(x={p['x']}, y={p['y']})"
+
+@jsonrpc.method
+def round_float(value: float) -> int:
+    return round(value)
+
+@jsonrpc.method
+def python_repr(value: Any) -> str:
+    return repr(value)
+
+@jsonrpc.method
+def unknown(x, y):
+    return x + y
 
 def matches_response(actual: dict | None, expected: dict | None) -> bool:
     """Check if actual response matches expected, with regex support for error messages."""
@@ -113,7 +124,6 @@ def matches_response(actual: dict | None, expected: dict | None) -> bool:
 
     return True
 
-
 def test_rpc(request: Any, expected_response: dict | None = None, description: str = ""):
     """Helper to test RPC calls"""
     print(f"\n{'='*60}")
@@ -122,24 +132,24 @@ def test_rpc(request: Any, expected_response: dict | None = None, description: s
 
     try:
         result = jsonrpc.dispatch(request)
-    except Exception as e:
-        print(f"\n❌ UNEXPECTED EXCEPTION:")
+    except Exception:
+        print("\n❌ UNEXPECTED EXCEPTION:")
         traceback.print_exc()
         sys.exit(1)
 
     if result is None:
         print("<-- (no response - notification)")
         if expected_response is not None:
-            print(f"\n❌ FAIL: Expected response but got None")
-            print(f"Expected: {json.dumps(expected_response, indent=2)}")
+            print("\n❌ FAIL: Expected response but got None")
+            print("Expected: {json.dumps(expected_response, indent=2)}")
             sys.exit(1)
     else:
         result_json = json.dumps(result, indent=2)
         print(f"<-- {result_json}")
 
         if expected_response is not None:
-            if not matches_response(result, expected_response):
-                print(f"\n❌ FAIL: Response mismatch")
+            if not matches_response(result, expected_response): # type: ignore
+                print("\n❌ FAIL: Response mismatch")
                 print(f"Expected: {json.dumps(expected_response, indent=2)}")
                 print(f"Got:      {result_json}")
                 sys.exit(1)
@@ -417,8 +427,15 @@ def run_all_tests():
     # Union type - invalid type
     test_rpc(
         '{"jsonrpc": "2.0", "method": "union_test", "params": [[1, 2, 3]], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: id has invalid type"}, "id": 1},
+        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: id union does not contain list"}, "id": 1},
         "Union type (int | str) - invalid list"
+    )
+
+    # Union type - null
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "union_test", "params": [null], "id": 1}',
+        {"jsonrpc": "2.0", "result": "ID: <nil>", "id": 1},
+        "Union type (int | str | None) - null value"
     )
 
     # ========================================
@@ -457,6 +474,47 @@ def run_all_tests():
         "Generic type list[str] - wrong outer type"
     )
 
+    # Point TypedDict - valid dict
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "point_pretty", "params": [{"x": 10, "y": 20}], "id": 1}',
+        {"jsonrpc": "2.0", "result": "Point(x=10, y=20)", "id": 1},
+        "TypedDict Point - valid dict"
+    )
+
+    # Point TypedDict - wrong outer type
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "point_pretty", "params": ["not a dict"], "id": 1}',
+        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: p expected dict, got str"}, "id": 1},
+        "TypedDict Point - wrong outer type"
+    )
+
+    # Convert from int to float
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "round_float", "params": [3], "id": 1}',
+        {"jsonrpc": "2.0", "result": 3, "id": 1},
+        "Convert int to float for float parameter"
+    )
+
+    # Any type - various inputs
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "python_repr", "params": [42], "id": 1}',
+        {"jsonrpc": "2.0", "result": "42", "id": 1},
+        "Any type - int value"
+    )
+
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "python_repr", "params": ["hello"], "id": 1}',
+        {"jsonrpc": "2.0", "result": "'hello'", "id": 1},
+        "Any type - str value"
+    )
+
+    # Unspecified types (unknown) - should accept anything
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "unknown", "params": [10, 20], "id": 1}',
+        {"jsonrpc": "2.0", "result": 30, "id": 1},
+        "Unknown parameter types - accept any"
+    )
+
     # ========================================
     # NOTIFICATION ERROR HANDLING
     # ========================================
@@ -475,10 +533,21 @@ def run_all_tests():
         "Notification - invalid params does not produce response"
     )
 
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "exception", "id": 1}',
+        {"jsonrpc": "2.0", "error": {"code": -32603, "message": "regex:Python exception"}, "id": 1},
+        "Method that raises python exception"
+    )
+
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "exception"}',
+        None,
+        "Notification - method that raises python exception"
+    )
+
     print("\n" + "="*60)
     print("ALL TESTS PASSED! ✓")
     print("="*60)
-
 
 if __name__ == "__main__":
     run_all_tests()
