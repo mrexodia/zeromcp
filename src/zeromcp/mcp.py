@@ -1,11 +1,12 @@
+import sys
 import time
 import uuid
 import json
+import inspect
 import threading
 import traceback
-import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, get_type_hints, Annotated, BinaryIO
+from typing import Any, Callable, Union, Annotated, BinaryIO, NotRequired, get_origin, get_args, get_type_hints
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
@@ -338,8 +339,6 @@ class McpServer:
 
     def _type_to_json_schema(self, py_type: Any) -> dict:
         """Convert Python type hint to JSON schema object"""
-        from typing import get_origin, get_args, Union
-
         # Handle Annotated[Type, "description"]
         if get_origin(py_type) is Annotated:
             args = get_args(py_type)
@@ -391,13 +390,6 @@ class McpServer:
 
     def _typed_dict_to_schema(self, typed_dict_class) -> dict:
         """Convert TypedDict to JSON schema"""
-        try:
-            from typing_extensions import NotRequired
-        except ImportError:
-            from typing import NotRequired
-
-        from typing import get_origin, get_args
-
         hints = get_type_hints(typed_dict_class, include_extras=True)
         properties = {}
         required = []
@@ -432,8 +424,6 @@ class McpServer:
 
     def _generate_tool_schema(self, func_name: str, func: Callable) -> dict:
         """Generate MCP tool schema from a function"""
-        import inspect
-
         hints = get_type_hints(func, include_extras=True)
         return_type = hints.pop("return", None)
         sig = inspect.signature(func)
