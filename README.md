@@ -44,7 +44,7 @@ def greet(
     return f"Hello, {name}!"
 
 if __name__ == "__main__":
-    mcp.start("127.0.0.1", 8000)
+    mcp.serve("127.0.0.1", 8000)
 ```
 
 Then manually test your MCP server with the [inspector](https://github.com/modelcontextprotocol/inspector):

@@ -62,6 +62,13 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
         """Override to suppress default logging or customize"""
         pass
 
+    def send_error(self, code, message=None, explain=None):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(f"{message}\n".encode("utf-8"))
+
     def handle(self):
         """Override to add error handling for connection errors"""
         try:
@@ -204,7 +211,7 @@ class McpServer:
     def tool(self, func: Callable) -> Callable:
         return self.tools.method(func)
 
-    def start(self, host: str, port: int):
+    def serve(self, host: str, port: int):
         if self.running:
             print("[MCP] Server is already running")
             return
