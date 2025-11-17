@@ -91,6 +91,11 @@ def greeting_resource(
     """Resource providing greeting message"""
     return greet(name)
 
+@mcp.resource("example://error")
+def error_resource() -> None:
+    """Resource that always fails (for testing error handling)"""
+    raise McpToolError("This is a resource error for testing purposes.")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MCP Example Server")
     parser.add_argument("--transport", help="Transport (stdio or http://host:port)", default="http://127.0.0.1:5001")
@@ -110,13 +115,8 @@ if __name__ == "__main__":
 
         mcp.serve(url.hostname, url.port)
 
-        print("\n" + "="*60)
-        print("Server is running. Press Ctrl+C to stop.")
-        print("="*60)
-
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
+            input("Server is running, press Enter or Ctrl+C to stop.")
+        except (KeyboardInterrupt, EOFError):
             print("\n\nStopping server...")
             mcp.stop()
