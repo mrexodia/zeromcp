@@ -1,6 +1,7 @@
 """Example MCP server with test tools"""
 import time
 import argparse
+from urllib.parse import urlparse
 from typing import Annotated, Optional, TypedDict, NotRequired
 from zeromcp import McpToolError, McpServer
 
@@ -92,18 +93,22 @@ def greeting_resource(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MCP Example Server")
-    parser.add_argument("--stdio", action="store_true", help="Run MCP server over stdio")
+    parser.add_argument("--transport", help="Transport (stdio or http://host:port)", default="http://127.0.0.1:5001")
     args = parser.parse_args()
-    if args.stdio:
+    if args.transport == "stdio":
         mcp.stdio()
     else:
+        url = urlparse(args.transport)
+        if url.hostname is None or url.port is None:
+            raise Exception(f"Invalid transport URL: {args.transport}")
+
         print("Starting MCP Example Server...")
         print("\nAvailable tools:")
         for name in mcp._tools.methods.keys():
             func = mcp._tools.methods[name]
             print(f"  - {name}: {func.__doc__}")
 
-        mcp.serve("127.0.0.1", 5001)
+        mcp.serve(url.hostname, url.port)
 
         print("\n" + "="*60)
         print("Server is running. Press Ctrl+C to stop.")
