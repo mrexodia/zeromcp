@@ -58,7 +58,9 @@ class _McpSseConnection:
             return False
 
 class _McpHttpRequestHandler(BaseHTTPRequestHandler):
-    mcp_server: "McpServer"
+    def __init__(self, request, client_address, server):
+        self.mcp_server: "McpServer" = getattr(server, "mcp_server")
+        super().__init__(request, client_address, server)
 
     def log_message(self, format, *args):
         """Override to suppress default logging or customize"""
@@ -198,8 +200,8 @@ class McpServer:
         self.name = name
         self.tools = McpToolRegistry()
 
-        self.http_server = None
-        self.server_thread = None
+        self.http_server: ThreadingHTTPServer | None = None
+        self.server_thread: threading.Thread | None = None
         self.running = False
         self.sse_connections: dict[str, _McpSseConnection] = {}
 
@@ -218,9 +220,43 @@ class McpServer:
             print("[MCP] Server is already running")
             return
 
-        self.server_thread = threading.Thread(target=self._run_server, daemon=True, args=(host, port))
+        # Create server with deferred binding
+        self.http_server = ThreadingHTTPServer(
+            (host, port),
+            _McpHttpRequestHandler,
+            bind_and_activate=False
+        )
+        self.http_server.allow_reuse_address = False
+
+        # Set the MCPServer instance on the handler class
+        setattr(self.http_server, "mcp_server", self)
+
+        try:
+            # Bind and activate in main thread - errors propagate synchronously
+            self.http_server.server_bind()
+            self.http_server.server_activate()
+        except OSError:
+            # Cleanup on binding failure
+            self.http_server.server_close()
+            self.http_server = None
+            raise
+
+        # Only start thread after successful bind
         self.running = True
+        def serve_forever():
+            try:
+                self.http_server.serve_forever() # type: ignore
+            except Exception as e:
+                print(f"[MCP] Server error: {e}")
+                traceback.print_exc()
+            finally:
+                self.running = False
+        self.server_thread = threading.Thread(target=serve_forever, daemon=True)
         self.server_thread.start()
+
+        print("[MCP] Server started:")
+        print(f"  Streamable HTTP: http://{host}:{port}/mcp")
+        print(f"  SSE: http://{host}:{port}/sse")
 
     def stop(self):
         if not self.running:
@@ -259,32 +295,6 @@ class McpServer:
                     stdout.flush()
             except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
                 break
-
-    def _run_server(self, host: str, port: int):
-        """Run the HTTP server main loop using ThreadingHTTPServer"""
-        # Set the MCPServer instance on the handler class
-        _McpHttpRequestHandler.mcp_server = self
-
-
-        # Create HTTP server with threading support and exclusive binding
-        self.http_server = ThreadingHTTPServer(
-            (host, port),
-            _McpHttpRequestHandler
-        )
-        self.http_server.allow_reuse_address = False
-
-        print("[MCP] Server started:")
-        print(f"  Streamable HTTP: http://{host}:{port}/mcp")
-        print(f"  SSE: http://{host}:{port}/sse")
-
-        try:
-            # Serve until shutdown() is called
-            self.http_server.serve_forever()
-        except Exception as e:
-            print(f"[MCP] Server error: {e}")
-            traceback.print_exc()
-        finally:
-            self.running = False
 
     def _mcp_ping(self, _meta: dict | None = None) -> dict:
         """MCP ping method"""
