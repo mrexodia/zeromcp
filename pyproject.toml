@@ -1,6 +1,6 @@
 [project]
 name = "zeromcp"
-version = "0.1.0"
+version = "1.0.0"
 description = "Zero-dependency MCP server implementation"
 readme = "README.md"
 requires-python = ">=3.11"
