@@ -1,5 +1,6 @@
 """Example MCP server with test tools"""
 import time
+import argparse
 from typing import Annotated, Optional, TypedDict, NotRequired
 from zeromcp import McpToolError, McpServer
 
@@ -78,22 +79,28 @@ def struct_get(
     ]
 
 if __name__ == "__main__":
-    print("Starting MCP Example Server...")
-    print("\nAvailable tools:")
-    for name in mcp.tools.methods.keys():
-        func = mcp.tools.methods[name]
-        print(f"  - {name}: {func.__doc__}")
+    parser = argparse.ArgumentParser(description="MCP Example Server")
+    parser.add_argument("--stdio", action="store_true", help="Run MCP server over stdio")
+    args = parser.parse_args()
+    if args.stdio:
+        mcp.stdio()
+    else:
+        print("Starting MCP Example Server...")
+        print("\nAvailable tools:")
+        for name in mcp.tools.methods.keys():
+            func = mcp.tools.methods[name]
+            print(f"  - {name}: {func.__doc__}")
 
-    mcp.start("127.0.0.1", 5001)
+        mcp.serve("127.0.0.1", 5001)
 
-    print("\n" + "="*60)
-    print("Server is running. Press Ctrl+C to stop.")
-    print("="*60)
+        print("\n" + "="*60)
+        print("Server is running. Press Ctrl+C to stop.")
+        print("="*60)
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n\nStopping server...")
-        mcp.stop()
-        print("Server stopped.")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\n\nStopping server...")
+            mcp.stop()
+            print("Server stopped.")

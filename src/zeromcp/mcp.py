@@ -3,8 +3,9 @@ import uuid
 import json
 import threading
 import traceback
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, get_type_hints, Annotated
+from typing import Any, Callable, get_type_hints, Annotated, BinaryIO
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
@@ -243,6 +244,20 @@ class McpServer:
             self.server_thread.join(timeout=2)
 
         print("[MCP] Server stopped")
+
+    def stdio(self, stdin: BinaryIO = sys.stdin.buffer, stdout: BinaryIO = sys.stdout.buffer):
+        while True:
+            try:
+                request = stdin.readline()
+                if not request: # EOF
+                    break
+
+                response = self.mcp_registry.dispatch(request)
+                if response is not None:
+                    stdout.write(json.dumps(response).encode("utf-8") + b"\n")
+                    stdout.flush()
+            except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
+                break
 
     def _run_server(self, host: str, port: int):
         """Run the HTTP server main loop using ThreadingHTTPServer"""

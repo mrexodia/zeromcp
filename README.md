@@ -10,7 +10,8 @@ A lightweight, handcrafted implementation of the [Model Context Protocol](https:
 - 🎯 **Type-safe** - Native Python type annotations for everything
 - 🚀 **Fast** - Minimal overhead, maximum performance
 - 🛠️ **Handcrafted** - Written by a human, verified against the spec
-- 🌐 **HTTP/SSE transport** - Streamable responses (stdio planned)
+- 🌐 **HTTP/SSE transport** - Streamable responses
+- 📡 **Stdio transport** - For legacy clients
 - 📦 **Tiny** - Less than 1,000 lines of code
 
 ## Installation
@@ -61,6 +62,37 @@ Once things are working you can configure the `mcp.json`:
     "my-server": {
       "type": "http",
       "url": "http://127.0.0.1/mcp"
+    }
+  }
+}
+```
+
+## Stdio Transport
+
+For MCP clients that only support stdio transport:
+
+```python
+from zeromcp import McpServer
+
+mcp = McpServer("my-server")
+
+@mcp.tool
+def greet(name: str) -> str:
+    """Generate a greeting"""
+    return f"Hello, {name}!"
+
+if __name__ == "__main__":
+    mcp.stdio()
+```
+
+Then configure in `mcp.json` (different for every client):
+
+```json
+{
+  "mcpServers": {
+    "my-server": {
+      "command": "python",
+      "args": ["path/to/server.py"]
     }
   }
 }
@@ -139,3 +171,21 @@ def divide(
         raise McpToolError("Division by zero")
     return numerator / denominator
 ```
+
+## Supported clients
+
+The following clients have been tested:
+
+- [Claude Code](https://code.claude.com/docs/en/mcp#installing-mcp-servers)
+- [Claude Desktop](https://modelcontextprotocol.io/docs/develop/connect-local-servers#installing-the-filesystem-server) (_stdio only_)
+- [Visual Studio Code](https://code.visualstudio.com/docs/copilot/customization/mcp-servers)
+- [Roo Code](https://docs.roocode.com/features/mcp/using-mcp-in-roo) / [Cline](https://docs.cline.bot/mcp/configuring-mcp-servers) / [Kilo Code](https://kilocode.ai/docs/features/mcp/using-mcp-in-kilo-code)
+- [LM Studio](https://lmstudio.ai/docs/app/mcp)
+- [Jan](https://www.jan.ai/docs/desktop/mcp#configure-and-use-mcps-within-jan)
+- [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/#how-to-set-up-your-mcp-server)
+- [Cursor](https://cursor.com/docs/context/mcp)
+- [Windsurf](https://docs.windsurf.com/windsurf/cascade/mcp)
+- [Zed](https://zed.dev/docs/ai/mcp) (_stdio only_)
+- [Warp](https://docs.warp.dev/knowledge-and-collaboration/mcp#adding-an-mcp-server)
+
+_Note_: generally the `/mcp` endpoint is preferred, but not all clients support it correctly.
