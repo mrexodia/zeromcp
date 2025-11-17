@@ -78,6 +78,18 @@ def struct_get(
         for name in (names if isinstance(names, list) else [names])
     ]
 
+@mcp.resource("example://system_info")
+def system_info_resource() -> SystemInfo:
+    """Resource providing system information"""
+    return get_system_info()
+
+@mcp.resource("example://greeting/{name}")
+def greeting_resource(
+    name: Annotated[str, "Name to greet from resource"]
+) -> GreetingResponse:
+    """Resource providing greeting message"""
+    return greet(name)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MCP Example Server")
     parser.add_argument("--stdio", action="store_true", help="Run MCP server over stdio")
@@ -87,8 +99,8 @@ if __name__ == "__main__":
     else:
         print("Starting MCP Example Server...")
         print("\nAvailable tools:")
-        for name in mcp.tools.methods.keys():
-            func = mcp.tools.methods[name]
+        for name in mcp._tools.methods.keys():
+            func = mcp._tools.methods[name]
             print(f"  - {name}: {func.__doc__}")
 
         mcp.serve("127.0.0.1", 5001)
@@ -103,4 +115,3 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n\nStopping server...")
             mcp.stop()
-            print("Server stopped.")

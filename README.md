@@ -172,6 +172,26 @@ def divide(
     return numerator / denominator
 ```
 
+## Resources
+
+Expose read-only data via URI patterns. Resources are serialized as JSON.
+
+```python
+from typing import Annotated
+
+@mcp.resource("file://data.txt")
+def read_file() -> dict:
+    """Get information about data.txt"""
+    return {"name": "data.txt", "size": 1024}
+
+@mcp.resource("file://{filename}")
+def read_any_file(
+    filename: Annotated[str, "Name of file to read"]
+) -> dict:
+    """Get information about any file"""
+    return {"name": filename, "size": 2048}
+```
+
 ## Supported clients
 
 The following clients have been tested:

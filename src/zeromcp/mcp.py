@@ -1,3 +1,4 @@
+import re
 import sys
 import time
 import uuid
@@ -16,7 +17,7 @@ class McpToolError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
 
-class McpToolRegistry(JsonRpcRegistry):
+class _McpRpcRegistry(JsonRpcRegistry):
     """JSON-RPC registry with custom error handling for MCP tools"""
     def map_exception(self, e: Exception) -> JsonRpcError:
         if isinstance(e, McpToolError):
@@ -83,10 +84,10 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         match urlparse(self.path).path:
-            case "/mcp":
-                self.send_error(405, "Method Not Allowed")
             case "/sse":
                 self._handle_sse_get()
+            case "/mcp":
+                self.send_error(405, "Method Not Allowed")
             case _:
                 self.send_error(404, "Not Found")
 
@@ -96,10 +97,10 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
         match urlparse(self.path).path:
-            case "/mcp":
-                self._handle_mcp_post(body)
             case "/sse":
                 self._handle_sse_post(body)
+            case "/mcp":
+                self._handle_mcp_post(body)
             case _:
                 self.send_error(404, "Not Found")
 
@@ -112,30 +113,10 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
-    def _handle_mcp_post(self, body: bytes):
-        # Dispatch to MCP registry
-        response = self.mcp_server.mcp_registry.dispatch(body)
-
-        def send_response(status: int, body: bytes):
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version")
-            self.end_headers()
-            self.wfile.write(body)
-
-        # Check if notification (returns None)
-        if response is None:
-            send_response(202, b"Accepted")
-        else:
-            send_response(200, json.dumps(response).encode("utf-8"))
-
     def _handle_sse_get(self):
         # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
-        self.mcp_server.sse_connections[conn.session_id] = conn
+        self.mcp_server._sse_connections[conn.session_id] = conn
 
         try:
             # Send SSE headers
@@ -151,7 +132,7 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
 
             # Keep connection alive with periodic pings
             last_ping = time.time()
-            while conn.alive and self.mcp_server.running:
+            while conn.alive and self.mcp_server._running:
                 now = time.time()
                 if now - last_ping > 30:  # Ping every 30 seconds
                     if not conn.send_event("ping", {}):
@@ -161,8 +142,8 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
 
         finally:
             conn.alive = False
-            if conn.session_id in self.mcp_server.sse_connections:
-                del self.mcp_server.sse_connections[conn.session_id]
+            if conn.session_id in self.mcp_server._sse_connections:
+                del self.mcp_server._sse_connections[conn.session_id]
 
     def _handle_sse_post(self, body: bytes):
         query_params = parse_qs(urlparse(self.path).query)
@@ -172,11 +153,12 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
             return
 
         # Dispatch to MCP registry
-        response = self.mcp_server.mcp_registry.dispatch(body)
+        setattr(self.mcp_server._protocol_version, "data", "2024-11-05")
+        response = self.mcp_server._mcp.dispatch(body)
 
         # Send SSE response if necessary
         if response is not None:
-            sse_conn = self.mcp_server.sse_connections.get(session_id)
+            sse_conn = self.mcp_server._sse_connections.get(session_id)
             if sse_conn is None or not sse_conn.alive:
                 # No SSE connection found
                 error_msg = f"No active SSE connection found for session {session_id}"
@@ -195,90 +177,123 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-class McpServer:
-    def __init__(self, name: str):
-        self.name = name
-        self.tools = McpToolRegistry()
+    def _handle_mcp_post(self, body: bytes):
+        # Dispatch to MCP registry
+        setattr(self.mcp_server._protocol_version, "data", "2025-06-18")
+        response = self.mcp_server._mcp.dispatch(body)
 
-        self.http_server: ThreadingHTTPServer | None = None
-        self.server_thread: threading.Thread | None = None
-        self.running = False
-        self.sse_connections: dict[str, _McpSseConnection] = {}
+        def send_response(status: int, body: bytes):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version")
+            self.end_headers()
+            self.wfile.write(body)
+
+        # Check if notification (returns None)
+        if response is None:
+            send_response(202, b"Accepted")
+        else:
+            send_response(200, json.dumps(response).encode("utf-8"))
+
+class McpServer:
+    def __init__(self, name: str, version = "1.0.0"):
+        self.name = name
+        self.version = version
+
+        self._tools = _McpRpcRegistry()
+        self._resources = _McpRpcRegistry()
+        self._http_server: ThreadingHTTPServer | None = None
+        self._server_thread: threading.Thread | None = None
+        self._running = False
+        self._sse_connections: dict[str, _McpSseConnection] = {}
+        self._protocol_version = threading.local()
 
         # Register MCP protocol methods with correct names
-        self.mcp_registry = JsonRpcRegistry()
-        self.mcp_registry.methods["ping"] = self._mcp_ping
-        self.mcp_registry.methods["initialize"] = self._mcp_initialize
-        self.mcp_registry.methods["tools/list"] = self._mcp_tools_list
-        self.mcp_registry.methods["tools/call"] = self._mcp_tools_call
+        self._mcp = JsonRpcRegistry()
+        self._mcp.methods["ping"] = self._mcp_ping
+        self._mcp.methods["initialize"] = self._mcp_initialize
+        self._mcp.methods["tools/list"] = self._mcp_tools_list
+        self._mcp.methods["tools/call"] = self._mcp_tools_call
+        self._mcp.methods["resources/list"] = self._mcp_resources_list
+        self._mcp.methods["resources/templates/list"] = self._mcp_resource_templates_list
+        self._mcp.methods["resources/read"] = self._mcp_resources_read
 
     def tool(self, func: Callable) -> Callable:
-        return self.tools.method(func)
+        return self._tools.method(func)
+
+    def resource(self, uri: str) -> Callable[[Callable], Callable]:
+        def decorator(func: Callable) -> Callable:
+            setattr(func, "__resource_uri__", uri)
+            return self._resources.method(func)
+        return decorator
 
     def serve(self, host: str, port: int):
-        if self.running:
+        if self._running:
             print("[MCP] Server is already running")
             return
 
         # Create server with deferred binding
-        self.http_server = ThreadingHTTPServer(
+        self._http_server = ThreadingHTTPServer(
             (host, port),
             _McpHttpRequestHandler,
             bind_and_activate=False
         )
-        self.http_server.allow_reuse_address = False
+        self._http_server.allow_reuse_address = False
 
         # Set the MCPServer instance on the handler class
-        setattr(self.http_server, "mcp_server", self)
+        setattr(self._http_server, "mcp_server", self)
 
         try:
             # Bind and activate in main thread - errors propagate synchronously
-            self.http_server.server_bind()
-            self.http_server.server_activate()
+            self._http_server.server_bind()
+            self._http_server.server_activate()
         except OSError:
             # Cleanup on binding failure
-            self.http_server.server_close()
-            self.http_server = None
+            self._http_server.server_close()
+            self._http_server = None
             raise
 
         # Only start thread after successful bind
-        self.running = True
+        self._running = True
         def serve_forever():
             try:
-                self.http_server.serve_forever() # type: ignore
+                self._http_server.serve_forever() # type: ignore
             except Exception as e:
                 print(f"[MCP] Server error: {e}")
                 traceback.print_exc()
             finally:
-                self.running = False
-        self.server_thread = threading.Thread(target=serve_forever, daemon=True)
-        self.server_thread.start()
+                self._running = False
+        self._server_thread = threading.Thread(target=serve_forever, daemon=True)
+        self._server_thread.start()
 
         print("[MCP] Server started:")
         print(f"  Streamable HTTP: http://{host}:{port}/mcp")
         print(f"  SSE: http://{host}:{port}/sse")
 
     def stop(self):
-        if not self.running:
+        if not self._running:
             return
 
-        self.running = False
+        self._running = False
 
         # Close all SSE connections
-        for conn in self.sse_connections.values():
+        for conn in self._sse_connections.values():
             conn.alive = False
-        self.sse_connections.clear()
+        self._sse_connections.clear()
 
         # Shutdown the HTTP server
-        if self.http_server:
+        if self._http_server:
             # shutdown() must be called from a different thread
             # than the one running serve_forever()
-            self.http_server.shutdown()
-            self.http_server.server_close()
-            self.http_server = None
+            self._http_server.shutdown()
+            self._http_server.server_close()
+            self._http_server = None
 
-        if self.server_thread:
-            self.server_thread.join(timeout=2)
+        if self._server_thread:
+            self._server_thread.join()
 
         print("[MCP] Server stopped")
 
@@ -289,7 +304,7 @@ class McpServer:
                 if not request: # EOF
                     break
 
-                response = self.mcp_registry.dispatch(request)
+                response = self._mcp.dispatch(request)
                 if response is not None:
                     stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                     stdout.flush()
@@ -303,13 +318,17 @@ class McpServer:
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
         return {
-            "protocolVersion": protocolVersion,
+            "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
             "capabilities": {
-                "tools": {}
+                "tools": {},
+                "resources": {
+                    "subscribe": False,
+                    "listChanged": False,
+                },
             },
             "serverInfo": {
                 "name": self.name,
-                "version": "1.0.0"
+                "version": self.version,
             },
         }
 
@@ -318,14 +337,14 @@ class McpServer:
         return {
             "tools": [
                 self._generate_tool_schema(func_name, func)
-                for func_name, func in self.tools.methods.items()
-            ]
+                for func_name, func in self._tools.methods.items()
+            ],
         }
 
     def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/call method"""
         # Wrap tool call in JSON-RPC request
-        tool_response = self.tools.dispatch({
+        tool_response = self._tools.dispatch({
             "jsonrpc": "2.0",
             "method": name,
             "params": arguments,
@@ -337,14 +356,115 @@ class McpServer:
             error = tool_response["error"]
             return {
                 "content": [{"type": "text", "text": error.get("message", "Unknown error")}],
-                "isError": True
+                "isError": True,
             }
 
         result = tool_response.get("result") if tool_response else None
         return {
             "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
             "structuredContent": result if isinstance(result, dict) else {"value": result},
-            "isError": False
+            "isError": False,
+        }
+
+    def _mcp_resources_list(self, _meta: dict | None = None) -> dict:
+        """MCP resources/list method - returns static resources only (no URI parameters)"""
+        resources = []
+        for func_name, func in self._resources.methods.items():
+            uri: str = getattr(func, "__resource_uri__")
+
+            # Skip templates (resources with parameters like {addr})
+            if "{" in uri:
+                continue
+
+            description = func.__doc__ or f"Read {uri}"
+            description = description.strip().split("\n")[0] if description else ""
+
+            resources.append({
+                "uri": uri,
+                "name": func_name,
+                "description": description,
+                "mimeType": "application/json",
+            })
+
+        return {"resources": resources}
+
+    def _mcp_resource_templates_list(self, _meta: dict | None = None) -> dict:
+        """MCP resources/templates/list method - returns parameterized resource templates"""
+        templates = []
+        for func_name, func in self._resources.methods.items():
+            uri: str = getattr(func, "__resource_uri__")
+
+            # Only include templates (resources with parameters like {addr})
+            if "{" not in uri:
+                continue
+
+            description = func.__doc__ or f"Read {uri}"
+            description = description.strip().split("\n")[0] if description else ""
+
+            templates.append({
+                "uriTemplate": uri,
+                "name": func_name,
+                "description": description,
+                "mimeType": "application/json",
+            })
+
+        return {"resourceTemplates": templates}
+
+    def _mcp_resources_read(self, uri: str, _meta: dict | None = None) -> dict:
+        """MCP resources/read method"""
+
+        # Try to match URI against all registered resource patterns
+        for func_name, func in self._resources.methods.items():
+            pattern: str = getattr(func, "__resource_uri__")
+
+            # Convert pattern to regex, replacing {param} with named capture groups
+            regex_pattern = re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", pattern)
+            regex_pattern = f"^{regex_pattern}$"
+
+            match = re.match(regex_pattern, uri)
+            if match:
+                # Found matching resource - call it via JSON-RPC
+                params = list(match.groupdict().values())
+
+                tool_response = self._resources.dispatch({
+                    "jsonrpc": "2.0",
+                    "method": func_name,
+                    "params": params,
+                    "id": None,
+                })
+
+                if tool_response and "error" in tool_response:
+                    error = tool_response["error"]
+                    return {
+                        "contents": [{
+                            "uri": uri,
+                            "mimeType": "application/json",
+                            "text": json.dumps({"error": error.get("message", "Unknown error")}, indent=2),
+                        }],
+                        "isError": True,
+                    }
+
+                result = tool_response.get("result") if tool_response else None
+                return {
+                    "contents": [{
+                        "uri": uri,
+                        "mimeType": "application/json",
+                        "text": json.dumps(result, indent=2),
+                    }]
+                }
+
+        # No matching resource found
+        available: list[str] = [getattr(f, "__resource_uri__") for f in self._resources.methods.values()]
+        return {
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json.dumps({
+                    "error": f"Resource not found: {uri}",
+                    "available_patterns": available,
+                }, indent=2),
+            }],
+            "isError": True,
         }
 
     def _type_to_json_schema(self, py_type: Any) -> dict:
@@ -425,7 +545,7 @@ class McpServer:
 
         schema = {
             "type": "object",
-            "properties": properties
+            "properties": properties,
         }
         if required:
             schema["required"] = required
@@ -465,7 +585,7 @@ class McpServer:
             "inputSchema": {
                 "type": "object",
                 "properties": properties,
-                "required": required
+                "required": required,
             }
         }
 
@@ -478,9 +598,9 @@ class McpServer:
                 schema["outputSchema"] = {
                     "type": "object",
                     "properties": {
-                        "value": return_schema
+                        "value": return_schema,
                     },
-                    "required": ["value"]
+                    "required": ["value"],
                 }
             else:
                 schema["outputSchema"] = return_schema
