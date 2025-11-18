@@ -7,17 +7,6 @@ from zeromcp import McpToolError, McpServer
 
 mcp = McpServer("example")
 
-class SystemInfo(TypedDict):
-    platform: Annotated[str, "Operating system platform"]
-    python_version: Annotated[str, "Python version"]
-    machine: Annotated[str, "Machine architecture"]
-    timestamp: Annotated[float, "Current timestamp"]
-
-class GreetingResponse(TypedDict):
-    message: Annotated[str, "Greeting message"]
-    name: Annotated[str, "Name that was greeted"]
-    age: Annotated[NotRequired[int], "Age if provided"]
-
 @mcp.tool
 def divide(
     numerator: Annotated[float, "Numerator"],
@@ -25,6 +14,11 @@ def divide(
 ) -> float:
     """Divide two numbers (no zero check - tests natural exceptions)"""
     return numerator / denominator
+
+class GreetingResponse(TypedDict):
+    message: Annotated[str, "Greeting message"]
+    name: Annotated[str, "Name that was greeted"]
+    age: Annotated[NotRequired[int], "Age if provided"]
 
 @mcp.tool
 def greet(
@@ -42,6 +36,12 @@ def greet(
         "message": f"Hello, {name}!",
         "name": name
     }
+
+class SystemInfo(TypedDict):
+    platform: Annotated[str, "Operating system platform"]
+    python_version: Annotated[str, "Python version"]
+    machine: Annotated[str, "Machine architecture"]
+    timestamp: Annotated[float, "Current timestamp"]
 
 @mcp.tool
 def get_system_info() -> SystemInfo:
@@ -78,6 +78,16 @@ def struct_get(
         })
         for name in (names if isinstance(names, list) else [names])
     ]
+
+@mcp.tool
+def random_dict(param: dict[str, int] | None) -> dict:
+    """Return a random dictionary for testing serialization"""
+    return {
+        **(param or {}),
+        "x": 42,
+        "y": 7,
+        "z": 99,
+    }
 
 @mcp.resource("example://system_info")
 def system_info_resource() -> SystemInfo:

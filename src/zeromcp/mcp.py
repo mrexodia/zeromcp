@@ -7,7 +7,8 @@ import inspect
 import threading
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Union, Annotated, BinaryIO, NotRequired, get_origin, get_args, get_type_hints
+from typing import Any, Callable, Union, Annotated, BinaryIO, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
+from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
@@ -161,9 +162,7 @@ class _McpHttpRequestHandler(BaseHTTPRequestHandler):
             sse_conn = self.mcp_server._sse_connections.get(session_id)
             if sse_conn is None or not sse_conn.alive:
                 # No SSE connection found
-                error_msg = f"No active SSE connection found for session {session_id}"
-                print(f"[MCP SSE ERROR] {error_msg}")
-                self.send_error(400, error_msg)
+                self.send_error(400, f"No active SSE connection found for session {session_id}")
                 return
 
             # Send response via SSE event stream
@@ -362,7 +361,7 @@ class McpServer:
         result = tool_response.get("result") if tool_response else None
         return {
             "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
-            "structuredContent": result if isinstance(result, dict) else {"value": result},
+            "structuredContent": result if isinstance(result, dict) else {"result": result},
             "isError": False,
         }
 
@@ -469,88 +468,68 @@ class McpServer:
 
     def _type_to_json_schema(self, py_type: Any) -> dict:
         """Convert Python type hint to JSON schema object"""
-        # Handle Annotated[Type, "description"]
-        if get_origin(py_type) is Annotated:
+        origin = get_origin(py_type)
+        # Annotated[T, "description"]
+        if origin is Annotated:
             args = get_args(py_type)
-            actual_type = args[0]
-            description = args[1] if len(args) > 1 else None
-            schema = self._type_to_json_schema(actual_type)
-            if description:
-                schema["description"] = description
-            return schema
+            return {
+                **self._type_to_json_schema(args[0]),
+                "description": str(args[-1]),
+            }
 
-        # Handle Union/Optional types
-        if get_origin(py_type) is Union:
-            union_args = get_args(py_type)
-            non_none = [t for t in union_args if t is not type(None)]
-            if len(non_none) == 1:
-                return self._type_to_json_schema(non_none[0])
-            # Multiple types -> anyOf
-            return {"anyOf": [self._type_to_json_schema(t) for t in non_none]}
+        # NotRequired[T]
+        if origin is NotRequired:
+            return self._type_to_json_schema(get_args(py_type)[0])
+
+        # Union[Ts..], Optional[T] and T1 | T2
+        if origin in (Union, UnionType):
+            return {"anyOf": [self._type_to_json_schema(t) for t in get_args(py_type)]}
+
+        # list[T]
+        if origin is list:
+            return {
+                "type": "array",
+                "items": self._type_to_json_schema(get_args(py_type)[0]),
+            }
+
+        # dict[str, T]
+        if origin is dict:
+            return {
+                "type": "object",
+                "additionalProperties": self._type_to_json_schema(get_args(py_type)[1]),
+            }
+
+        # TypedDict
+        if is_typeddict(py_type):
+            return self._typed_dict_to_schema(py_type)
 
         # Primitives
-        if py_type == int:
-            return {"type": "integer"}
-        if py_type == float:
-            return {"type": "number"}
-        if py_type == str:
-            return {"type": "string"}
-        if py_type == bool:
-            return {"type": "boolean"}
-
-        # Handle list types
-        if py_type == list or get_origin(py_type) is list:
-            args = get_args(py_type)
-            schema: dict[str, Any] = {"type": "array"}
-            if args:
-                schema["items"] = self._type_to_json_schema(args[0])
-            return schema
-
-        # Handle dict types
-        if py_type == dict or get_origin(py_type) is dict:
-            return {"type": "object"}
-
-        # TypedDict detection
-        if hasattr(py_type, "__annotations__"):
-            if hasattr(py_type, "__required_keys__") or hasattr(py_type, "__optional_keys__"):
-                return self._typed_dict_to_schema(py_type)
-
-        # Fallback
-        return {"type": "object"}
+        return {
+            "type": {
+                int: "integer",
+                float: "number",
+                str: "string",
+                bool: "boolean",
+                list: "array",
+                dict: "object",
+                type(None): "null",
+            }.get(py_type, "object"),
+        }
 
     def _typed_dict_to_schema(self, typed_dict_class) -> dict:
         """Convert TypedDict to JSON schema"""
         hints = get_type_hints(typed_dict_class, include_extras=True)
-        properties = {}
-        required = []
+        required_keys = getattr(typed_dict_class, '__required_keys__', set(hints.keys()))
 
-        for field_name, field_type in hints.items():
-            # Check if field is NotRequired
-            is_not_required = get_origin(field_type) is NotRequired
-            if is_not_required:
-                field_type = get_args(field_type)[0]
-
-            properties[field_name] = self._type_to_json_schema(field_type)
-
-            # Add to required if not NotRequired
-            if not is_not_required:
-                # Also check __required_keys__ if available
-                if hasattr(typed_dict_class, "__required_keys__"):
-                    if field_name in typed_dict_class.__required_keys__:
-                        if field_name not in required:
-                            required.append(field_name)
-                else:
-                    # Default to required if no __required_keys__
-                    required.append(field_name)
-
-        schema = {
+        return {
             "type": "object",
-            "properties": properties,
+            "properties": {
+                field_name: self._type_to_json_schema(field_type)
+                for field_name, field_type in hints.items()
+            },
+            "required": [key for key in hints.keys() if key in required_keys],
+            "additionalProperties": False
         }
-        if required:
-            schema["required"] = required
-
-        return schema
 
     def _generate_tool_schema(self, func_name: str, func: Callable) -> dict:
         """Generate MCP tool schema from a function"""
@@ -563,25 +542,16 @@ class McpServer:
         required = []
 
         for param_name, param_type in hints.items():
-            # Check if parameter has default value
-            param = sig.parameters.get(param_name)
-            has_default = param and param.default is not inspect.Parameter.empty
-
-            # Use _type_to_json_schema to handle all type conversions including Union
             properties[param_name] = self._type_to_json_schema(param_type)
 
-            # Only add to required if no default value
-            if not has_default:
+            # Add to required if no default value
+            param = sig.parameters.get(param_name)
+            if not param or param.default is inspect.Parameter.empty:
                 required.append(param_name)
-
-        # Get docstring as description
-        description = func.__doc__ or f"Call {func_name}"
-        if description:
-            description = description.strip()
 
         schema: dict[str, Any] = {
             "name": func_name,
-            "description": description,
+            "description": (func.__doc__ or f"Call {func_name}").strip(),
             "inputSchema": {
                 "type": "object",
                 "properties": properties,
@@ -592,17 +562,15 @@ class McpServer:
         # Add outputSchema if return type exists and is not None
         if return_type and return_type is not type(None):
             return_schema = self._type_to_json_schema(return_type)
-            # MCP spec requires outputSchema to always be type: object
-            # Wrap primitives in an object with a "value" property
+
+            # Wrap non-object returns in a "result" property
             if return_schema.get("type") != "object":
-                schema["outputSchema"] = {
+                return_schema = {
                     "type": "object",
-                    "properties": {
-                        "value": return_schema,
-                    },
-                    "required": ["value"],
+                    "properties": {"result": return_schema},
+                    "required": ["result"],
                 }
-            else:
-                schema["outputSchema"] = return_schema
+
+            schema["outputSchema"] = return_schema
 
         return schema
