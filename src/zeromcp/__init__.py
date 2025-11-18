@@ -1,3 +1,3 @@
-from .mcp import McpServer, McpToolError
+from .mcp import McpRpcRegistry, McpToolError, McpServer
 
-__all__ = ["McpServer", "McpToolError"]
+__all__ = ["McpRpcRegistry", "McpToolError", "McpServer"]

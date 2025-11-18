@@ -119,8 +119,8 @@ if __name__ == "__main__":
 
         print("Starting MCP Example Server...")
         print("\nAvailable tools:")
-        for name in mcp._tools.methods.keys():
-            func = mcp._tools.methods[name]
+        for name in mcp.tools.methods.keys():
+            func = mcp.tools.methods[name]
             print(f"  - {name}: {func.__doc__}")
 
         mcp.serve(url.hostname, url.port)
