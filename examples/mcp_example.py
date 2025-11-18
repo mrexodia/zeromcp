@@ -1,21 +1,11 @@
 """Example MCP server with test tools"""
 import time
 import argparse
+from urllib.parse import urlparse
 from typing import Annotated, Optional, TypedDict, NotRequired
 from zeromcp import McpToolError, McpServer
 
 mcp = McpServer("example")
-
-class SystemInfo(TypedDict):
-    platform: Annotated[str, "Operating system platform"]
-    python_version: Annotated[str, "Python version"]
-    machine: Annotated[str, "Machine architecture"]
-    timestamp: Annotated[float, "Current timestamp"]
-
-class GreetingResponse(TypedDict):
-    message: Annotated[str, "Greeting message"]
-    name: Annotated[str, "Name that was greeted"]
-    age: Annotated[NotRequired[int], "Age if provided"]
 
 @mcp.tool
 def divide(
@@ -24,6 +14,11 @@ def divide(
 ) -> float:
     """Divide two numbers (no zero check - tests natural exceptions)"""
     return numerator / denominator
+
+class GreetingResponse(TypedDict):
+    message: Annotated[str, "Greeting message"]
+    name: Annotated[str, "Name that was greeted"]
+    age: Annotated[NotRequired[int], "Age if provided"]
 
 @mcp.tool
 def greet(
@@ -41,6 +36,12 @@ def greet(
         "message": f"Hello, {name}!",
         "name": name
     }
+
+class SystemInfo(TypedDict):
+    platform: Annotated[str, "Operating system platform"]
+    python_version: Annotated[str, "Python version"]
+    machine: Annotated[str, "Machine architecture"]
+    timestamp: Annotated[float, "Current timestamp"]
 
 @mcp.tool
 def get_system_info() -> SystemInfo:
@@ -78,6 +79,16 @@ def struct_get(
         for name in (names if isinstance(names, list) else [names])
     ]
 
+@mcp.tool
+def random_dict(param: dict[str, int] | None) -> dict:
+    """Return a random dictionary for testing serialization"""
+    return {
+        **(param or {}),
+        "x": 42,
+        "y": 7,
+        "z": 99,
+    }
+
 @mcp.resource("example://system_info")
 def system_info_resource() -> SystemInfo:
     """Resource providing system information"""
@@ -90,28 +101,32 @@ def greeting_resource(
     """Resource providing greeting message"""
     return greet(name)
 
+@mcp.resource("example://error")
+def error_resource() -> None:
+    """Resource that always fails (for testing error handling)"""
+    raise McpToolError("This is a resource error for testing purposes.")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MCP Example Server")
-    parser.add_argument("--stdio", action="store_true", help="Run MCP server over stdio")
+    parser.add_argument("--transport", help="Transport (stdio or http://host:port)", default="http://127.0.0.1:5001")
     args = parser.parse_args()
-    if args.stdio:
+    if args.transport == "stdio":
         mcp.stdio()
     else:
+        url = urlparse(args.transport)
+        if url.hostname is None or url.port is None:
+            raise Exception(f"Invalid transport URL: {args.transport}")
+
         print("Starting MCP Example Server...")
         print("\nAvailable tools:")
         for name in mcp._tools.methods.keys():
             func = mcp._tools.methods[name]
             print(f"  - {name}: {func.__doc__}")
 
-        mcp.serve("127.0.0.1", 5001)
-
-        print("\n" + "="*60)
-        print("Server is running. Press Ctrl+C to stop.")
-        print("="*60)
+        mcp.serve(url.hostname, url.port)
 
         try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
+            input("Server is running, press Enter or Ctrl+C to stop.")
+        except (KeyboardInterrupt, EOFError):
             print("\n\nStopping server...")
             mcp.stop()

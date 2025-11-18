@@ -1,6 +1,6 @@
 [project]
 name = "zeromcp"
-version = "1.0.0"
+version = "0.0.0"
 description = "Zero-dependency MCP server implementation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,3 +15,12 @@ Issues = "https://github.com/mrexodia/zeromcp/issues"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.11.3",
+    "mcp>=1.21.2",
+]
+
+[tool.coverage.report]
+omit = ["tests/*"]
