@@ -9,7 +9,7 @@ A lightweight, handcrafted implementation of the [Model Context Protocol](https:
 - ✨ **Zero dependencies** - Pure Python, standard library only
 - 🎯 **Type-safe** - Native Python type annotations for everything
 - 🚀 **Fast** - Minimal overhead, maximum performance
-- 🛠️ **Handcrafted** - Written by a human, verified against the spec
+- 🛠️ **Handcrafted** - Written by a human<sup>[1](#ai-usage)</sup>, verified against the spec
 - 🌐 **HTTP/SSE transport** - Streamable responses
 - 📡 **Stdio transport** - For legacy clients
 - 📦 **Tiny** - Less than 1,000 lines of code
@@ -209,3 +209,6 @@ The following clients have been tested:
 - [Warp](https://docs.warp.dev/knowledge-and-collaboration/mcp#adding-an-mcp-server)
 
 _Note_: generally the `/mcp` endpoint is preferred, but not all clients support it correctly.
+
+<a name="ai-usage"></a>
+<sup>1</sup>README and some of the tests written by Claude
