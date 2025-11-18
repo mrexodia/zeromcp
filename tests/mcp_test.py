@@ -216,6 +216,7 @@ async def test_serve():
         bufsize=1,
     )
     try:
+        await asyncio.sleep(0.5) # Wait for server to start
         await test_sse(address)
         await test_streamablehttp(address)
     finally:
@@ -225,8 +226,8 @@ async def test_serve():
     pass
 
 async def main():
-    await test_stdio()
     await test_serve()
+    await test_stdio()
 
 if __name__ == "__main__":
     import os
