@@ -12,3 +12,4 @@ wheels/
 # Coverage
 htmlcov/
 .coverage*
+coverage.xml

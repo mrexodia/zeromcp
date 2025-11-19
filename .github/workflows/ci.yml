@@ -51,6 +51,9 @@ jobs:
       - name: Test MCP
         run: uv run coverage run --data-file=.coverage.mcp tests/mcp_test.py
 
+      - name: Test Server
+        run: uv run coverage run --data-file=.coverage.server tests/server_test.py
+
       - name: Generate coverage report
         run: |
           uv run coverage combine

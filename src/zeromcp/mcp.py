@@ -71,7 +71,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def send_error(self, code, message=None, explain=None):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if self.mcp_server.cors_allow_origin:
+            self.send_header("Access-Control-Allow-Origin", self.mcp_server.cors_allow_origin)
         self.end_headers()
         self.wfile.write(f"{message}\n".encode("utf-8"))
 
@@ -93,8 +94,13 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Not Found")
 
     def do_POST(self):
-        # Read request body (TODO: do we need to handle chunked encoding and what about no Content-Length?)
+        # Read request body
         content_length = int(self.headers.get("Content-Length", 0))
+        
+        if content_length > self.mcp_server.post_body_limit:
+            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+            return
+
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
         match urlparse(self.path).path:
@@ -108,10 +114,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, Mcp-Protocol-Version")
-        self.send_header("Access-Control-Max-Age", "86400")
+        if self.mcp_server.cors_allow_origin:
+            self.send_header("Access-Control-Allow-Origin", self.mcp_server.cors_allow_origin)
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, Mcp-Protocol-Version")
+            self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
     def _handle_sse_get(self):
@@ -125,7 +132,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            if self.mcp_server.cors_allow_origin:
+                self.send_header("Access-Control-Allow-Origin", self.mcp_server.cors_allow_origin)
             self.end_headers()
 
             # Send endpoint event with session ID for routing
@@ -172,7 +180,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.send_response(202)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if self.mcp_server.cors_allow_origin:
+            self.send_header("Access-Control-Allow-Origin", self.mcp_server.cors_allow_origin)
         self.end_headers()
         self.wfile.write(body)
 
@@ -185,9 +194,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version")
+            if self.mcp_server.cors_allow_origin:
+                self.send_header("Access-Control-Allow-Origin", self.mcp_server.cors_allow_origin)
+                self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Mcp-Session-Id, Mcp-Protocol-Version")
             self.end_headers()
             self.wfile.write(body)
 
@@ -201,6 +211,8 @@ class McpServer:
     def __init__(self, name: str, version = "1.0.0"):
         self.name = name
         self.version = version
+        self.cors_allow_origin = "*"
+        self.post_body_limit = 10 * 1024 * 1024
         self.tools = McpRpcRegistry()
         self.resources = McpRpcRegistry()
 
