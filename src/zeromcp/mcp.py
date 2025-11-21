@@ -312,6 +312,11 @@ class McpServer:
                 if not request: # EOF
                     break
 
+                # Strip whitespace (trailing newline) before parsing
+                request = request.strip()
+                if not request:
+                    continue
+
                 response = self.registry.dispatch(request)
                 if response is not None:
                     stdout.write(json.dumps(response).encode("utf-8") + b"\n")
