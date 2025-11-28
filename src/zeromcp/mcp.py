@@ -219,6 +219,7 @@ class McpServer:
         self.post_body_limit = 10 * 1024 * 1024
         self.tools = McpRpcRegistry()
         self.resources = McpRpcRegistry()
+        self.prompts = McpRpcRegistry()
 
         self._http_server: HTTPServer | None = None
         self._server_thread: threading.Thread | None = None
@@ -235,9 +236,14 @@ class McpServer:
         self.registry.methods["resources/list"] = self._mcp_resources_list
         self.registry.methods["resources/templates/list"] = self._mcp_resource_templates_list
         self.registry.methods["resources/read"] = self._mcp_resources_read
+        self.registry.methods["prompts/list"] = self._mcp_prompts_list
+        self.registry.methods["prompts/get"] = self._mcp_prompts_get
 
     def tool(self, func: Callable) -> Callable:
         return self.tools.method(func)
+
+    def prompt(self, func: Callable) -> Callable:
+        return self.prompts.method(func)
 
     def resource(self, uri: str) -> Callable[[Callable], Callable]:
         def decorator(func: Callable) -> Callable:
@@ -279,7 +285,7 @@ class McpServer:
 
         def serve_forever():
             try:
-                self._http_server.serve_forever() # type: ignore
+                self._http_server.serve_forever()  # type: ignore
             except Exception as e:
                 print(f"[MCP] Server error: {e}")
                 traceback.print_exc()
@@ -323,7 +329,7 @@ class McpServer:
         while True:
             try:
                 request = stdin.readline()
-                if not request: # EOF
+                if not request:  # EOF
                     break
 
                 # Strip whitespace (trailing newline) before parsing
@@ -335,7 +341,7 @@ class McpServer:
                 if response is not None:
                     stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                     stdout.flush()
-            except (BrokenPipeError, KeyboardInterrupt): # Client disconnected
+            except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
                 break
 
     def _mcp_ping(self, _meta: dict | None = None) -> dict:
@@ -352,6 +358,7 @@ class McpServer:
                     "subscribe": False,
                     "listChanged": False,
                 },
+                "prompts": {},
             },
             "serverInfo": {
                 "name": self.name,
@@ -465,6 +472,87 @@ class McpServer:
                 }
 
         raise JsonRpcException(-32002, "Resource not found", {"uri": uri})
+
+    def _mcp_prompts_list(self, _meta: dict | None = None) -> dict:
+        """MCP prompts/list method"""
+        return {
+            "prompts": [
+                self._generate_prompt_schema(func_name, func)
+                for func_name, func in self.prompts.methods.items()
+            ],
+        }
+
+    def _mcp_prompts_get(
+        self, name: str, arguments: dict | None = None, _meta: dict | None = None
+    ) -> dict:
+        """MCP prompts/get method"""
+        # Dispatch to prompts registry
+        prompt_response = self.prompts.dispatch(
+            {
+                "jsonrpc": "2.0",
+                "method": name,
+                "params": arguments,
+                "id": None,
+            }
+        )
+        assert prompt_response is not None, "Only notification requests return None"
+
+        # Check for error response
+        if "error" in prompt_response:
+            error = prompt_response["error"]
+            raise JsonRpcException(error["code"], error["message"], error.get("data"))
+
+        result = prompt_response.get("result")
+
+        # Pass through list of messages directly
+        if isinstance(result, list):
+            return {"messages": result}
+
+        # Convert non-string results to JSON
+        if not isinstance(result, str):
+            result = json.dumps(result, indent=2)
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": {"type": "text", "text": result},
+                },
+            ],
+        }
+
+    def _generate_prompt_schema(self, func_name: str, func: Callable) -> dict:
+        """Generate MCP prompt schema from a function"""
+        hints = get_type_hints(func, include_extras=True)
+        hints.pop("return", None)
+        sig = inspect.signature(func)
+
+        # Build arguments list (PromptArgument format)
+        arguments = []
+        for param_name, param_type in hints.items():
+            arg: dict[str, Any] = {"name": param_name}
+
+            # Extract description from Annotated
+            origin = get_origin(param_type)
+            if origin is Annotated:
+                args = get_args(param_type)
+                arg["description"] = str(args[-1])
+
+            # Check if required (no default value)
+            param = sig.parameters.get(param_name)
+            if not param or param.default is inspect.Parameter.empty:
+                arg["required"] = True
+
+            arguments.append(arg)
+
+        schema: dict[str, Any] = {
+            "name": func_name,
+            "description": (func.__doc__ or f"Prompt {func_name}").strip(),
+        }
+
+        if arguments:
+            schema["arguments"] = arguments
+
+        return schema
 
     def _type_to_json_schema(self, py_type: Any) -> dict:
         """Convert Python type hint to JSON schema object"""
