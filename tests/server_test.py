@@ -22,37 +22,76 @@ def run_server(name="test", **kwargs):
     finally:
         server.stop()
 
+PING_JSON = {"jsonrpc": "2.0", "method": "ping", "id": 1}
+
 def test_cors_permissive():
-    print("Testing CORS permissive (cors_allow_origin='*')...")
-    with run_server(cors_allow_origin="*") as (base_url, _):
+    print("Testing CORS permissive (cors_allowed_origins='*')...")
+    with run_server(cors_allowed_origins="*") as (base_url, _):
+        test_origin = "http://example.com"
         # Test OPTIONS
-        resp = requests.options(f"{base_url}/mcp")
-        assert resp.headers["Access-Control-Allow-Origin"] == "*", "OPTIONS should have CORS header"
+        resp = requests.options(f"{base_url}/mcp", headers={"Origin": test_origin})
+        assert resp.headers.get("Access-Control-Allow-Origin") == test_origin, "OPTIONS should have CORS header"
 
         # Test POST
-        resp = requests.post(f"{base_url}/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
-        assert resp.headers["Access-Control-Allow-Origin"] == "*", "POST should have CORS header"
+        resp = requests.post(f"{base_url}/mcp", headers={"Origin": test_origin}, json=PING_JSON)
+        assert resp.headers.get("Access-Control-Allow-Origin") == test_origin, "POST should have CORS header"
     print("✓ PASS")
 
 def test_cors_restrictive():
-    print("Testing CORS restrictive (cors_allow_origin=None)...")
-    with run_server(cors_allow_origin=None) as (base_url, _):
+    print("Testing CORS restrictive (cors_allowed_origins=None)...")
+    with run_server(cors_allowed_origins=None) as (base_url, _):
         # Test OPTIONS
-        resp = requests.options(f"{base_url}/mcp")
+        resp = requests.options(f"{base_url}/mcp", headers={"Origin": "http://example.com"})
         assert "Access-Control-Allow-Origin" not in resp.headers, "OPTIONS should NOT have CORS header"
 
         # Test POST
-        resp = requests.post(f"{base_url}/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
+        resp = requests.post(f"{base_url}/mcp", headers={"Origin": "http://example.com"}, json=PING_JSON)
         assert "Access-Control-Allow-Origin" not in resp.headers, "POST should NOT have CORS header"
     print("✓ PASS")
+
+def test_cors_local():
+    print("Testing CORS localhost...")
+    with run_server() as (base_url, _):
+        # Test OPTIONS
+        resp = requests.options(f"{base_url}/mcp", headers={"Origin": "http://localhost:1234"})
+        assert resp.headers.get("Access-Control-Allow-Origin") == "http://localhost:1234", "OPTIONS should have CORS header"
+
+        # Test POST
+        resp = requests.post(f"{base_url}/mcp", headers={"Origin": "https://127.0.0.1:4321"}, json=PING_JSON)
+        assert resp.headers.get("Access-Control-Allow-Origin") == "https://127.0.0.1:4321", "POST should have CORS header (HTTPS)"
+
+        resp = requests.post(f"{base_url}/mcp", headers={"Origin": "http://[::1]:4321"}, json=PING_JSON)
+        assert resp.headers.get("Access-Control-Allow-Origin") == "http://[::1]:4321", "POST should have CORS header (IPv6)"
+
+        # Test OPTIONS with wrong origin
+        resp = requests.options(f"{base_url}/mcp", headers={"Origin": "http://example.com"})
+        assert "Access-Control-Allow-Origin" not in resp.headers, "OPTIONS should NOT have CORS header for wrong origin"
+
+def test_cors_list():
+    print("Testing CORS list...")
+    allowed_origins = ["http://example.com", "https://example.org"]
+    with run_server(cors_allowed_origins=allowed_origins) as (base_url, _):
+        # Test allowed origins
+        for origin in allowed_origins:
+            resp = requests.options(f"{base_url}/mcp", headers={"Origin": origin})
+            assert resp.headers.get("Access-Control-Allow-Origin") == origin, f"OPTIONS should have CORS header for {origin}"
+
+            resp = requests.post(f"{base_url}/mcp", headers={"Origin": origin}, json=PING_JSON)
+            assert resp.headers.get("Access-Control-Allow-Origin") == origin, f"POST should have CORS header for {origin}"
+
+        # Test disallowed origin
+        resp = requests.options(f"{base_url}/mcp", headers={"Origin": "http://notallowed.com"})
+        assert "Access-Control-Allow-Origin" not in resp.headers, "OPTIONS should NOT have CORS header for disallowed origin"
+
+        resp = requests.post(f"{base_url}/mcp", headers={"Origin": "http://notallowed.com"}, json=PING_JSON)
+        assert "Access-Control-Allow-Origin" not in resp.headers, "POST should NOT have CORS header for disallowed origin"
 
 def test_body_limit():
     print("Testing body limit...")
     # Set small limit (100 bytes)
     with run_server(post_body_limit=100) as (base_url, _):
         # Small request - should pass
-        small_payload = {"jsonrpc": "2.0", "method": "ping", "id": 1}
-        resp = requests.post(f"{base_url}/mcp", json=small_payload)
+        resp = requests.post(f"{base_url}/mcp", json=PING_JSON)
         assert resp.status_code == 200, "Small request should pass"
 
         # Large request - should fail
@@ -184,6 +223,8 @@ def run_all_tests():
     try:
         test_cors_permissive()
         test_cors_restrictive()
+        test_cors_local()
+        test_cors_list()
         test_body_limit()
         test_exception_redaction()
         test_exception_exposure()

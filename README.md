@@ -208,6 +208,36 @@ def code_review(
     return f"Please review this {language} code:\n\n```{language}\n{code}\n```"
 ```
 
+## CORS
+
+By default, zeromcp allows CORS requests from localhost origins (`localhost`, `127.0.0.1`, `::1`) on **any port**. This allows tools like the MCP Inspector or local AI tools to communicate with your MCP server.
+
+```python
+from zeromcp import McpServer
+
+mcp = McpServer("my-server")
+
+# Default: allow localhost on any port
+mcp.cors_allowed_origins = mcp.cors_localhost
+
+# Allow all origins (use with caution)
+mcp.cors_allowed_origins = "*"
+
+# Allow specific origins
+mcp.cors_allowed_origins = [
+    "http://localhost:3000",
+    "https://myapp.example.com",
+]
+
+# Disable CORS (blocks all browser cross-origin requests)
+mcp.cors_allowed_origins = None
+
+# Custom logic
+mcp.cors_allowed_origins = lambda origin: origin.endswith(".example.com")
+```
+
+Note: CORS only affects browser-based requests. Non-browser clients like `curl` or MCP desktop apps are unaffected by this setting.
+
 ## Supported clients
 
 The following clients have been tested:
