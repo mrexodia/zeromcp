@@ -12,7 +12,7 @@ from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
-from .jsonrpc import JsonRpcRegistry, JsonRpcError
+from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException
 
 class McpToolError(Exception):
     def __init__(self, message: str):
@@ -253,9 +253,7 @@ class McpServer:
         # Create server with deferred binding
         assert issubclass(request_handler, McpHttpRequestHandler)
         self._http_server = (ThreadingHTTPServer if background else HTTPServer)(
-            (host, port),
-            request_handler,
-            bind_and_activate=False
+            (host, port), request_handler, bind_and_activate=False
         )
         self._http_server.allow_reuse_address = False
 
@@ -379,67 +377,64 @@ class McpServer:
             "params": arguments,
             "id": None,
         })
+        assert tool_response is not None, "Only notification requests return None"
 
         # Check for error response
-        if tool_response and "error" in tool_response:
+        if "error" in tool_response:
             error = tool_response["error"]
             return {
-                "content": [{"type": "text", "text": error.get("message", "Unknown error")}],
+                "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
                 "isError": True,
             }
 
-        result = tool_response.get("result") if tool_response else None
+        result = tool_response.get("result")
         return {
             "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
             "structuredContent": result if isinstance(result, dict) else {"result": result},
             "isError": False,
         }
 
+    def _enumerate_resources(self):
+        for name, func in self.resources.methods.items():
+            uri: str = getattr(func, "__resource_uri__")
+            description = (func.__doc__ or f"Read {uri}").strip()
+            yield uri, name, description
+
     def _mcp_resources_list(self, _meta: dict | None = None) -> dict:
         """MCP resources/list method - returns static resources only (no URI parameters)"""
-        resources = []
-        for func_name, func in self.resources.methods.items():
-            uri: str = getattr(func, "__resource_uri__")
-
-            # Skip templates (resources with parameters like {addr})
-            if "{" in uri:
-                continue
-
-            resources.append({
-                "uri": uri,
-                "name": func_name,
-                "description": (func.__doc__ or f"Read {uri}").strip(),
-                "mimeType": "application/json",
-            })
-
-        return {"resources": resources}
+        return {
+            "resources": [
+                {
+                    "uri": uri,
+                    "name": name,
+                    "description": description,
+                    "mimeType": "application/json",
+                }
+                for uri, name, description in self._enumerate_resources()
+                if "{" not in uri
+            ]
+        }
 
     def _mcp_resource_templates_list(self, _meta: dict | None = None) -> dict:
         """MCP resources/templates/list method - returns parameterized resource templates"""
-        templates = []
-        for func_name, func in self.resources.methods.items():
-            uri: str = getattr(func, "__resource_uri__")
-
-            # Only include templates (resources with parameters like {addr})
-            if "{" not in uri:
-                continue
-
-            templates.append({
-                "uriTemplate": uri,
-                "name": func_name,
-                "description": (func.__doc__ or f"Read {uri}").strip(),
-                "mimeType": "application/json",
-            })
-
-        return {"resourceTemplates": templates}
+        return {
+            "resourceTemplates": [
+                {
+                    "uriTemplate": uri,
+                    "name": name,
+                    "description": description,
+                    "mimeType": "application/json",
+                }
+                for uri, name, description in self._enumerate_resources()
+                if "{" in uri
+            ]
+        }
 
     def _mcp_resources_read(self, uri: str, _meta: dict | None = None) -> dict:
         """MCP resources/read method"""
 
         # Try to match URI against all registered resource patterns
-        for func_name, func in self.resources.methods.items():
-            pattern: str = getattr(func, "__resource_uri__")
-
+        for pattern, name, _ in self._enumerate_resources():
             # Convert pattern to regex, replacing {param} with named capture groups
             regex_pattern = re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", pattern)
             regex_pattern = f"^{regex_pattern}$"
@@ -449,46 +444,27 @@ class McpServer:
                 # Found matching resource - call it via JSON-RPC
                 params = list(match.groupdict().values())
 
-                tool_response = self.resources.dispatch({
+                resource_response = self.resources.dispatch({
                     "jsonrpc": "2.0",
-                    "method": func_name,
+                    "method": name,
                     "params": params,
                     "id": None,
                 })
+                assert resource_response is not None, "Only notification requests return None"
 
-                if tool_response and "error" in tool_response:
-                    error = tool_response["error"]
-                    return {
-                        "contents": [{
-                            "uri": uri,
-                            "mimeType": "application/json",
-                            "text": json.dumps({"error": error.get("message", "Unknown error")}, indent=2),
-                        }],
-                        "isError": True,
-                    }
+                if "error" in resource_response:
+                    error = resource_response["error"]
+                    raise JsonRpcException(error["code"], error["message"], error.get("data"))
 
-                result = tool_response.get("result") if tool_response else None
                 return {
                     "contents": [{
                         "uri": uri,
                         "mimeType": "application/json",
-                        "text": json.dumps(result, indent=2),
+                        "text": json.dumps(resource_response.get("result"), indent=2),
                     }]
                 }
 
-        # No matching resource found
-        available: list[str] = [getattr(f, "__resource_uri__") for f in self.resources.methods.values()]
-        return {
-            "contents": [{
-                "uri": uri,
-                "mimeType": "application/json",
-                "text": json.dumps({
-                    "error": f"Resource not found: {uri}",
-                    "available_patterns": available,
-                }, indent=2),
-            }],
-            "isError": True,
-        }
+        raise JsonRpcException(-32002, "Resource not found", {"uri": uri})
 
     def _type_to_json_schema(self, py_type: Any) -> dict:
         """Convert Python type hint to JSON schema object"""
@@ -543,7 +519,7 @@ class McpServer:
     def _typed_dict_to_schema(self, typed_dict_class) -> dict:
         """Convert TypedDict to JSON schema"""
         hints = get_type_hints(typed_dict_class, include_extras=True)
-        required_keys = getattr(typed_dict_class, '__required_keys__', set(hints.keys()))
+        required_keys = getattr(typed_dict_class, "__required_keys__", set(hints.keys()))
 
         return {
             "type": "object",
@@ -552,7 +528,7 @@ class McpServer:
                 for field_name, field_type in hints.items()
             },
             "required": [key for key in hints.keys() if key in required_keys],
-            "additionalProperties": False
+            "additionalProperties": False,
         }
 
     def _generate_tool_schema(self, func_name: str, func: Callable) -> dict:
@@ -580,7 +556,7 @@ class McpServer:
                 "type": "object",
                 "properties": properties,
                 "required": required,
-            }
+            },
         }
 
         # Add outputSchema if return type exists and is not None

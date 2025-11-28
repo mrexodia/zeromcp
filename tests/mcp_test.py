@@ -5,7 +5,7 @@ import asyncio
 import subprocess
 
 from pydantic import AnyUrl
-from mcp import ClientSession, StdioServerParameters, types
+from mcp import ClientSession, StdioServerParameters, McpError, types
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -146,25 +146,27 @@ async def test_edge_cases(prefix: str, session: ClientSession):
     print(f"[{prefix}] Division by zero error: {result.content[0] if result.content else 'no content'}")
 
     # Test invalid resource URI
-    result = await session.read_resource(AnyUrl("example://invalid_resource"))
-    assert hasattr(result, "isError") and result.isError, "should error on invalid resource"  # type: ignore
-    content = result.contents[0]  # type: ignore
-    if isinstance(content, types.TextResourceContents):
-        print(f"[{prefix}] Invalid resource error: {content.text}")
+    try:
+        await session.read_resource(AnyUrl("example://invalid_resource"))
+        assert False, "should have raised on invalid resource"
+    except McpError as e:
+        assert "Resource not found" in e.error.message, "expected invalid resource error"
 
     # Test resource template with missing substitution
-    result = await session.read_resource(AnyUrl("example://greeting/"))
-    assert hasattr(result, "isError") and result.isError, "should error on malformed template URI"  # type: ignore
-    content = result.contents[0]  # type: ignore
-    if isinstance(content, types.TextResourceContents):
-        print(f"[{prefix}] Malformed template URI error: {content.text}")
+    try:
+        await session.read_resource(AnyUrl("example://greeting/"))
+        assert False, "should have raised on missing template parameter"
+    except McpError as e:
+        assert "Resource not found" in e.error.message, "expected missing substitution error"
 
     # Test resource that raises an error
-    result = await session.read_resource(AnyUrl("example://error"))
-    assert hasattr(result, "isError") and result.isError, "should error on error resource"  # type: ignore
-    content = result.contents[0]  # type: ignore
-    if isinstance(content, types.TextResourceContents):
-        print(f"[{prefix}] Error resource error: {content.text}")
+    try:
+        await session.read_resource(AnyUrl("example://error"))
+        assert False, "should have raised on error resource"
+    except McpError as e:
+        assert "This is a resource error for testing purposes." in e.error.message, (
+            "expected resource error message"
+        )
 
 def coverage_wrap(name: str, args: list[str]) -> list[str]:
     if os.environ.get("COVERAGE_RUN"):
