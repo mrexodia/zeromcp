@@ -1,5 +1,3 @@
-import threading
-import time
 import requests
 import sys
 import socket
@@ -30,7 +28,7 @@ def test_cors_permissive():
         # Test OPTIONS
         resp = requests.options(f"{base_url}/mcp")
         assert resp.headers["Access-Control-Allow-Origin"] == "*", "OPTIONS should have CORS header"
-        
+
         # Test POST
         resp = requests.post(f"{base_url}/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
         assert resp.headers["Access-Control-Allow-Origin"] == "*", "POST should have CORS header"
@@ -42,7 +40,7 @@ def test_cors_restrictive():
         # Test OPTIONS
         resp = requests.options(f"{base_url}/mcp")
         assert "Access-Control-Allow-Origin" not in resp.headers, "OPTIONS should NOT have CORS header"
-        
+
         # Test POST
         resp = requests.post(f"{base_url}/mcp", json={"jsonrpc": "2.0", "method": "ping", "id": 1})
         assert "Access-Control-Allow-Origin" not in resp.headers, "POST should NOT have CORS header"
@@ -56,7 +54,7 @@ def test_body_limit():
         small_payload = {"jsonrpc": "2.0", "method": "ping", "id": 1}
         resp = requests.post(f"{base_url}/mcp", json=small_payload)
         assert resp.status_code == 200, "Small request should pass"
-        
+
         # Large request - should fail
         large_payload = "x" * 200
         resp = requests.post(f"{base_url}/mcp", data=large_payload)
@@ -68,29 +66,29 @@ def test_exception_redaction():
     print("Testing exception redaction...")
     with run_server() as (base_url, server):
         server.tools.redact_exceptions = True
-        
+
         @server.tool
         def fail():
             raise ValueError("Secret internal info")
-            
+
         # Call via tools/call
         payload = {
-            "jsonrpc": "2.0", 
-            "method": "tools/call", 
-            "params": {"name": "fail", "arguments": {}}, 
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "fail", "arguments": {}},
             "id": 1
         }
         resp = requests.post(f"{base_url}/mcp", json=payload)
         data = resp.json()
-        
+
         # The outer JSON-RPC call succeeds
         assert "result" in data, f"Expected result, got error: {data.get('error')}"
         result = data["result"]
-        
+
         # The tool execution failed
         assert result["isError"] is True, "Tool execution should be an error"
         error_text = result["content"][0]["text"]
-        
+
         assert error_text == "Internal Error: Secret internal info", f"Should show redacted message, got: {error_text}"
         assert "Traceback" not in error_text, "Should NOT show traceback"
     print("✓ PASS")
@@ -99,29 +97,29 @@ def test_exception_exposure():
     print("Testing exception exposure (default)...")
     with run_server() as (base_url, server):
         server.tools.redact_exceptions = False
-        
+
         @server.tool
         def fail():
             raise ValueError("Secret internal info")
-            
+
         # Call via tools/call
         payload = {
-            "jsonrpc": "2.0", 
-            "method": "tools/call", 
-            "params": {"name": "fail", "arguments": {}}, 
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "fail", "arguments": {}},
             "id": 1
         }
         resp = requests.post(f"{base_url}/mcp", json=payload)
         data = resp.json()
-        
+
         # The outer JSON-RPC call succeeds
         assert "result" in data, f"Expected result, got error: {data.get('error')}"
         result = data["result"]
-        
+
         # The tool execution failed
         assert result["isError"] is True, "Tool execution should be an error"
         error_text = result["content"][0]["text"]
-        
+
         assert "Secret internal info" in error_text, "Should show exception message"
         assert "Traceback" in error_text, "Should show traceback"
     print("✓ PASS")
@@ -134,11 +132,11 @@ def test_http_errors():
         # GET /mcp -> 405 Method Not Allowed
         resp = requests.get(f"{base_url}/mcp")
         assert resp.status_code == 405, f"GET /mcp should return 405, got {resp.status_code}"
-        
+
         # GET /invalid -> 404 Not Found
         resp = requests.get(f"{base_url}/invalid")
         assert resp.status_code == 404, f"GET /invalid should return 404, got {resp.status_code}"
-        
+
         # POST /invalid -> 404 Not Found
         resp = requests.post(f"{base_url}/invalid", json={})
         assert resp.status_code == 404, f"POST /invalid should return 404, got {resp.status_code}"
@@ -151,7 +149,7 @@ def test_sse_errors():
         resp = requests.post(f"{base_url}/sse", json={})
         assert resp.status_code == 400, f"POST /sse without session should return 400, got {resp.status_code}"
         assert "Missing ?session" in resp.text
-        
+
         # POST /sse with invalid session -> 400 Bad Request
         resp = requests.post(f"{base_url}/sse?session=invalid-uuid", json={})
         assert resp.status_code == 400, f"POST /sse with invalid session should return 400, got {resp.status_code}"
@@ -165,11 +163,11 @@ def test_mcp_tool_error():
         @server.tool
         def fail_custom():
             raise McpToolError("Custom tool error")
-            
+
         resp = requests.post(f"{base_url}/mcp", json={
-            "jsonrpc": "2.0", 
-            "method": "tools/call", 
-            "params": {"name": "fail_custom", "arguments": {}}, 
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "fail_custom", "arguments": {}},
             "id": 1
         })
         data = resp.json()
@@ -182,7 +180,7 @@ def run_all_tests():
     print("="*60)
     print("SERVER TESTS")
     print("="*60)
-    
+
     try:
         test_cors_permissive()
         test_cors_restrictive()

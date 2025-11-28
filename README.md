@@ -192,6 +192,22 @@ def read_any_file(
     return {"name": filename, "size": 2048}
 ```
 
+## Prompts
+
+Expose reusable prompt templates with typed arguments.
+
+```python
+from typing import Annotated
+
+@mcp.prompt
+def code_review(
+    code: Annotated[str, "Code to review"],
+    language: Annotated[str, "Programming language"] = "python"
+) -> str:
+    """Review code for bugs and improvements"""
+    return f"Please review this {language} code:\n\n```{language}\n{code}\n```"
+```
+
 ## Supported clients
 
 The following clients have been tested:

@@ -29,7 +29,7 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/}
           VERSION=${VERSION#v}
           echo "Extracted version: $VERSION"
-          
+
           # Update version in pyproject.toml (works on both GNU and BSD sed)
           sed -i.bak "s/^version = .*/version = \"$VERSION\"/" pyproject.toml
           rm pyproject.toml.bak
@@ -44,6 +44,9 @@ jobs:
 
       - name: Type check
         run: uvx ty check
+
+      - name: Ruff check
+        run: uvx ruff check
 
       - name: Test JSON-RPC
         run: uv run coverage run --data-file=.coverage.jsonrpc tests/jsonrpc_test.py

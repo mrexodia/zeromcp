@@ -5,7 +5,7 @@ import asyncio
 import subprocess
 
 from pydantic import AnyUrl
-from mcp import ClientSession, StdioServerParameters, types
+from mcp import ClientSession, StdioServerParameters, McpError, types
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
@@ -39,6 +39,34 @@ async def test_example_server(prefix: str, session: ClientSession):
     print(f"[{prefix}] Available tools: {[t.name for t in tools.tools]}")
     tool_names = {t.name for t in tools.tools}
     assert tool_names == {"divide", "greet", "random_dict", "get_system_info", "failing_tool", "struct_get"}, f"unexpected tools: {tool_names}"
+
+    # List available prompts
+    prompts = await session.list_prompts()
+    print(f"[{prefix}] Available prompts: {[p.name for p in prompts.prompts]}")
+    prompt_names = {p.name for p in prompts.prompts}
+    assert prompt_names == {"code_review", "summarize"}, (
+        f"unexpected prompts: {prompt_names}"
+    )
+
+    # Get prompt with required argument only
+    result = await session.get_prompt("summarize", arguments={"text": "Hello world"})
+    assert result.messages, "expected messages"
+    assert result.messages[0].role == "user"
+    content = result.messages[0].content
+    assert isinstance(content, types.TextContent), "expected TextContent"
+    print(f"[{prefix}] Summarize prompt result: {content.text[:50]}...")
+    assert "Hello world" in content.text, "expected text in prompt"
+
+    # Get prompt with optional argument
+    result = await session.get_prompt(
+        "code_review", arguments={"code": "print('hi')", "language": "javascript"}
+    )
+    assert result.messages, "expected messages"
+    content = result.messages[0].content
+    assert isinstance(content, types.TextContent), "expected TextContent"
+    print(f"[{prefix}] Code review prompt result: {content.text[:50]}...")
+    assert "javascript" in content.text, "expected language in prompt"
+    assert "print('hi')" in content.text, "expected code in prompt"
 
     # Read a resource - assert content
     resource_content = await session.read_resource(AnyUrl("example://system_info"))
@@ -146,25 +174,39 @@ async def test_edge_cases(prefix: str, session: ClientSession):
     print(f"[{prefix}] Division by zero error: {result.content[0] if result.content else 'no content'}")
 
     # Test invalid resource URI
-    result = await session.read_resource(AnyUrl("example://invalid_resource"))
-    assert hasattr(result, "isError") and result.isError, "should error on invalid resource"  # type: ignore
-    content = result.contents[0]  # type: ignore
-    if isinstance(content, types.TextResourceContents):
-        print(f"[{prefix}] Invalid resource error: {content.text}")
+    try:
+        await session.read_resource(AnyUrl("example://invalid_resource"))
+        assert False, "should have raised on invalid resource"
+    except McpError as e:
+        assert "Resource not found" in e.error.message, "expected invalid resource error"
 
     # Test resource template with missing substitution
-    result = await session.read_resource(AnyUrl("example://greeting/"))
-    assert hasattr(result, "isError") and result.isError, "should error on malformed template URI"  # type: ignore
-    content = result.contents[0]  # type: ignore
-    if isinstance(content, types.TextResourceContents):
-        print(f"[{prefix}] Malformed template URI error: {content.text}")
+    try:
+        await session.read_resource(AnyUrl("example://greeting/"))
+        assert False, "should have raised on missing template parameter"
+    except McpError as e:
+        assert "Resource not found" in e.error.message, "expected missing substitution error"
 
     # Test resource that raises an error
-    result = await session.read_resource(AnyUrl("example://error"))
-    assert hasattr(result, "isError") and result.isError, "should error on error resource"  # type: ignore
-    content = result.contents[0]  # type: ignore
-    if isinstance(content, types.TextResourceContents):
-        print(f"[{prefix}] Error resource error: {content.text}")
+    try:
+        await session.read_resource(AnyUrl("example://error"))
+        assert False, "should have raised on error resource"
+    except McpError as e:
+        assert "This is a resource error for testing purposes." in e.error.message, (
+            "expected resource error message"
+        )
+
+    # Test non-existent prompt
+    try:
+        await session.get_prompt("nonexistent_prompt", arguments={})
+        assert False, "should have raised on non-existent prompt"
+    except McpError as e:
+        assert "Method 'nonexistent_prompt' not found" in e.error.message, (
+            "expected method not found error"
+        )
+
+    print(f"[{prefix}] Edge case tests passed!")
+
 
 def coverage_wrap(name: str, args: list[str]) -> list[str]:
     if os.environ.get("COVERAGE_RUN"):
@@ -216,12 +258,12 @@ async def test_serve():
         bufsize=1,
     )
     try:
-        await asyncio.sleep(0.5) # Wait for server to start
+        await asyncio.sleep(0.5)  # Wait for server to start
         await test_sse(address)
         await test_streamablehttp(address)
     finally:
         print("[serve] Terminating example MCP server")
-        process.stdin.close() # type: ignore
+        process.stdin.close()  # type: ignore
         process.wait()
     pass
 
