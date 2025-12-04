@@ -61,7 +61,7 @@ Once things are working you can configure the `mcp.json`:
   "mcpServers": {
     "my-server": {
       "type": "http",
-      "url": "http://127.0.0.1/mcp"
+      "url": "http://127.0.0.1:8000/mcp"
     }
   }
 }
