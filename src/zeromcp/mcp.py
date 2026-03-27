@@ -449,8 +449,9 @@ class McpServer:
             }
 
         result = tool_response.get("result")
+        content = result if isinstance(result, str) else json.dumps(result, indent=2)
         return {
-            "content": [{"type": "text", "text": json.dumps(result, indent=2)}],
+            "content": [{"type": "text", "text": content}],
             "structuredContent": result if isinstance(result, dict) else {"result": result},
             "isError": False,
         }
