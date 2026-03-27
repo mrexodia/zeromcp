@@ -82,12 +82,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             allowed = self.mcp_server.cors_allowed_origins
             if allowed is None:
                 return False
-            if callable(allowed):
-                return allowed(origin)
             if isinstance(allowed, str):
-                allowed = [allowed]
-            assert isinstance(allowed, list)
-            return "*" in allowed or origin in allowed
+                return allowed == "*" or origin == allowed
+            if isinstance(allowed, list):
+                return "*" in allowed or origin in allowed
+            return allowed(origin)
         if not is_allowed():
             return
         self.send_header("Access-Control-Allow-Origin", origin)
