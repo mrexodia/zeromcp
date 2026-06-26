@@ -138,6 +138,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def send_error(self, code, message=None, explain=None):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain")
+        if getattr(self, "close_connection", False):
+            self.send_header("Connection", "close")
         self.send_cors_headers()
         self.end_headers()
         self.wfile.write(f"{message}\n".encode("utf-8"))
@@ -205,20 +207,26 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> bytes | None:
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
             raw = self._read_chunked()
+            if raw is None:
+                return None
         else:
             content_length = int(self.headers.get("Content-Length", 0))
             if content_length > self.mcp_server.post_body_limit:
-                self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+                self._send_payload_too_large()
                 return None
             raw = self.rfile.read(content_length) if content_length > 0 else b""
 
         if len(raw) > self.mcp_server.post_body_limit:
-            self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+            self._send_payload_too_large()
             return None
 
         return self._decompress_body(raw)
 
-    def _read_chunked(self) -> bytes:
+    def _send_payload_too_large(self) -> None:
+        self.close_connection = True
+        self.send_error(413, f"Payload Too Large: exceeds {self.mcp_server.post_body_limit} bytes")
+
+    def _read_chunked(self) -> bytes | None:
         body = b""
         limit = self.mcp_server.post_body_limit
         while True:
@@ -229,30 +237,37 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 while self.rfile.readline().strip():
                     pass
                 break
-            body += self.rfile.read(min(chunk_size, limit + 1 - len(body)))
-            if len(body) > limit:
-                return body
+
+            if len(body) + chunk_size > limit:
+                self._send_payload_too_large()
+                return None
+
+            body += self.rfile.read(chunk_size)
             self.rfile.readline()
         return body
 
-    def _decompress_limited(self, decompressor: Any, data: bytes) -> bytes | None:
+    def _decompress_limited(self, decompressor: Any, data: bytes, wbits: int = 0) -> bytes | None:
         limit = self.mcp_server.post_body_limit
         output = decompressor.decompress(data, limit + 1)
         if len(output) > limit:
-            self.send_error(413, f"Payload Too Large: exceeds {limit} bytes")
+            self._send_payload_too_large()
             return None
 
-        output += decompressor.flush(limit + 1 - len(output))
-        if len(output) > limit:
-            self.send_error(413, f"Payload Too Large: exceeds {limit} bytes")
-            return None
+        while wbits and decompressor.unused_data:
+            remaining = decompressor.unused_data
+            decompressor = zlib.decompressobj(wbits)
+            output += decompressor.decompress(remaining, limit + 1 - len(output))
+            if len(output) > limit:
+                self._send_payload_too_large()
+                return None
         return output
 
     def _decompress_body(self, data: bytes) -> bytes | None:
         encoding = self.headers.get("Content-Encoding", "").lower().strip()
         try:
             if encoding in ("gzip", "x-gzip"):
-                return self._decompress_limited(zlib.decompressobj(16 + zlib.MAX_WBITS), data)
+                wbits = 16 + zlib.MAX_WBITS
+                return self._decompress_limited(zlib.decompressobj(wbits), data, wbits=wbits)
             elif encoding == "deflate":
                 wbits = zlib.MAX_WBITS if data[:1] == b'\x78' else -zlib.MAX_WBITS
                 return self._decompress_limited(zlib.decompressobj(wbits), data)
