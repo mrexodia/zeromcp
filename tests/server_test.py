@@ -1,10 +1,13 @@
+import gzip
+import io
 import json
 import requests
 import sys
 import socket
 import zlib
 from contextlib import contextmanager
-from zeromcp import McpServer
+from types import SimpleNamespace
+from zeromcp import McpServer, McpHttpRequestHandler
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -138,6 +141,56 @@ def test_compressed_body_limit():
     print("✓ PASS")
 
 
+def test_concatenated_gzip_body_limit():
+    print("Testing concatenated gzip body limit...")
+    with run_server(post_body_limit=100) as (base_url, _):
+        headers = {"Content-Encoding": "gzip", "Content-Type": "application/json"}
+        first_member = gzip.compress(json.dumps(PING_JSON).encode("utf-8"))
+        second_member = gzip.compress(b"x" * 1000)
+        resp = requests.post(f"{base_url}/mcp", headers=headers, data=first_member + second_member)
+        assert resp.status_code == 413, "Concatenated gzip members should count against decompressed limit"
+        assert "Payload Too Large" in resp.text, "Error message should mention payload size"
+    print("✓ PASS")
+
+
+def test_content_length_overlimit_closes_connection():
+    print("Testing Content-Length overlimit connection close...")
+    handler = object.__new__(McpHttpRequestHandler)
+    handler.mcp_server = SimpleNamespace(post_body_limit=5)
+    handler.headers = {"Content-Length": "10"}
+    handler.rfile = io.BytesIO(b"abcdefghijGET /mcp HTTP/1.1\r\n\r\n")
+    handler.close_connection = False
+    errors = []
+    handler.send_error = lambda code, message=None, explain=None: errors.append((code, message))
+
+    body = handler._read_body()
+
+    assert body is None, "Over-limit Content-Length body should be rejected"
+    assert handler.close_connection is True, "Over-limit Content-Length should close the connection"
+    assert errors and errors[0][0] == 413, "Over-limit Content-Length should send 413"
+    assert handler.rfile.read().startswith(b"abcdefghij"), "Over-limit Content-Length body should not need draining"
+    print("✓ PASS")
+
+
+def test_chunked_overlimit_closes_connection():
+    print("Testing chunked overlimit connection close...")
+    handler = object.__new__(McpHttpRequestHandler)
+    handler.mcp_server = SimpleNamespace(post_body_limit=5)
+    handler.headers = {"Transfer-Encoding": "chunked"}
+    handler.rfile = io.BytesIO(b"a\r\nabcdefghij\r\n0\r\n\r\nGET /mcp HTTP/1.1\r\n\r\n")
+    handler.close_connection = False
+    errors = []
+    handler.send_error = lambda code, message=None, explain=None: errors.append((code, message))
+
+    body = handler._read_body()
+
+    assert body is None, "Over-limit chunked body should be rejected"
+    assert handler.close_connection is True, "Over-limit chunked body should close the connection"
+    assert errors and errors[0][0] == 413, "Over-limit chunked body should send 413"
+    assert handler.rfile.read().startswith(b"abcdefghij"), "Over-limit chunked body should not need draining"
+    print("✓ PASS")
+
+
 def test_exception_redaction():
     print("Testing exception redaction...")
     with run_server() as (base_url, server):
@@ -264,7 +317,10 @@ def run_all_tests():
         test_dns_rebinding_host_header()
         test_cors_list()
         test_body_limit()
+        test_content_length_overlimit_closes_connection()
         test_compressed_body_limit()
+        test_concatenated_gzip_body_limit()
+        test_chunked_overlimit_closes_connection()
         test_exception_redaction()
         test_exception_exposure()
         test_http_errors()
