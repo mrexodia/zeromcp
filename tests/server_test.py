@@ -42,10 +42,12 @@ def test_cors_restrictive():
     with run_server(cors_allowed_origins=None) as (base_url, _):
         # Test OPTIONS
         resp = requests.options(f"{base_url}/mcp", headers={"Origin": "http://example.com"})
+        assert resp.status_code == 403, "OPTIONS should reject disallowed origin"
         assert "Access-Control-Allow-Origin" not in resp.headers, "OPTIONS should NOT have CORS header"
 
         # Test POST
         resp = requests.post(f"{base_url}/mcp", headers={"Origin": "http://example.com"}, json=PING_JSON)
+        assert resp.status_code == 403, "POST should reject disallowed origin"
         assert "Access-Control-Allow-Origin" not in resp.headers, "POST should NOT have CORS header"
     print("✓ PASS")
 
@@ -65,7 +67,21 @@ def test_cors_local():
 
         # Test OPTIONS with wrong origin
         resp = requests.options(f"{base_url}/mcp", headers={"Origin": "http://example.com"})
+        assert resp.status_code == 403, "OPTIONS should reject wrong origin"
         assert "Access-Control-Allow-Origin" not in resp.headers, "OPTIONS should NOT have CORS header for wrong origin"
+
+
+def test_dns_rebinding_host_header():
+    print("Testing DNS rebinding Host header guard...")
+    with run_server() as (base_url, _):
+        good = requests.post(f"{base_url}/mcp", headers={"Host": "localhost:1234"}, json=PING_JSON)
+        assert good.status_code == 200, "loopback Host should be accepted"
+
+        bad = requests.post(f"{base_url}/mcp", headers={"Host": "evil.example:1234"}, json=PING_JSON)
+        assert bad.status_code == 403, "non-loopback Host should be rejected for loopback-bound servers"
+        assert "Invalid Host" in bad.text
+    print("✓ PASS")
+
 
 def test_cors_list():
     print("Testing CORS list...")
@@ -81,10 +97,13 @@ def test_cors_list():
 
         # Test disallowed origin
         resp = requests.options(f"{base_url}/mcp", headers={"Origin": "http://notallowed.com"})
+        assert resp.status_code == 403, "OPTIONS should reject disallowed origin"
         assert "Access-Control-Allow-Origin" not in resp.headers, "OPTIONS should NOT have CORS header for disallowed origin"
 
         resp = requests.post(f"{base_url}/mcp", headers={"Origin": "http://notallowed.com"}, json=PING_JSON)
+        assert resp.status_code == 403, "POST should reject disallowed origin"
         assert "Access-Control-Allow-Origin" not in resp.headers, "POST should NOT have CORS header for disallowed origin"
+
 
 def test_body_limit():
     print("Testing body limit...")
@@ -224,6 +243,7 @@ def run_all_tests():
         test_cors_permissive()
         test_cors_restrictive()
         test_cors_local()
+        test_dns_rebinding_host_header()
         test_cors_list()
         test_body_limit()
         test_exception_redaction()
