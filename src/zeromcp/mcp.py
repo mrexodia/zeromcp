@@ -447,8 +447,11 @@ class McpServer:
         self._sse_connections: dict[str, _McpSseConnection] = {}
         self._http_sessions: set[str] = set()
         self._http_sessions_lock = threading.Lock()
+        self._pending_requests: dict[tuple[str | None, int | str], threading.Event] = {}
+        self._pending_requests_lock = threading.Lock()
         self._protocol_version = threading.local()
         self._transport_session_id = threading.local()
+        self._request_context = threading.local()
         self.require_streamable_http_session = False
 
         # Register MCP protocol methods with correct names
@@ -463,6 +466,7 @@ class McpServer:
         self.registry.methods["prompts/list"] = self._mcp_prompts_list
         self.registry.methods["prompts/get"] = self._mcp_prompts_get
         self.registry.methods["notifications/initialized"] = self._mcp_notifications_initialized
+        self.registry.methods["notifications/cancelled"] = self._mcp_notifications_cancelled
 
     def tool(self, func: Callable) -> Callable:
         return self.tools.method(func)
@@ -573,6 +577,11 @@ class McpServer:
             except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
                 break
 
+    def check_cancelled(self) -> None:
+        event = getattr(self._request_context, "cancel_event", None)
+        if event is not None and event.is_set():
+            raise JsonRpcException(-32800, "Request cancelled")
+
     def get_current_transport_session_id(self) -> str | None:
         return getattr(self._transport_session_id, "data", None)
 
@@ -625,33 +634,59 @@ class McpServer:
 
     def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/call method"""
-        # Wrap tool call in JSON-RPC request
-        tool_response = self.tools.dispatch({
-            "jsonrpc": "2.0",
-            "method": name,
-            "params": arguments,
-            "id": None,
-        })
-        assert tool_response is not None, "Only notification requests return None"
+        request_id = self.registry.current_request_id()
+        previous_cancel_event = getattr(self._request_context, "cancel_event", None)
+        cancel_event: threading.Event | None = None
+        if request_id is not None:
+            cancel_event = threading.Event()
+            key = (self.get_current_transport_session_id(), request_id)
+            with self._pending_requests_lock:
+                self._pending_requests[key] = cancel_event
+            setattr(self._request_context, "cancel_event", cancel_event)
 
-        # Check for error response
-        if "error" in tool_response:
-            error = tool_response["error"]
+        try:
+            # Wrap tool call in JSON-RPC request
+            tool_response = self.tools.dispatch({
+                "jsonrpc": "2.0",
+                "method": name,
+                "params": arguments,
+                "id": None,
+            })
+            assert tool_response is not None, "Only notification requests return None"
+
+            # Check for error response
+            if "error" in tool_response:
+                error = tool_response["error"]
+                if error["code"] == -32800:
+                    raise JsonRpcException(error["code"], error["message"], error.get("data"))
+                return {
+                    "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
+                    "isError": True,
+                }
+
+            result = tool_response.get("result")
+            content = result if isinstance(result, str) else json.dumps(result, indent=2)
             return {
-                "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
-                "isError": True,
+                "content": [{"type": "text", "text": content}],
+                "structuredContent": result if isinstance(result, dict) else {"result": result},
+                "isError": False,
             }
-
-        result = tool_response.get("result")
-        content = result if isinstance(result, str) else json.dumps(result, indent=2)
-        return {
-            "content": [{"type": "text", "text": content}],
-            "structuredContent": result if isinstance(result, dict) else {"result": result},
-            "isError": False,
-        }
+        finally:
+            if request_id is not None:
+                with self._pending_requests_lock:
+                    self._pending_requests.pop((self.get_current_transport_session_id(), request_id), None)
+            setattr(self._request_context, "cancel_event", previous_cancel_event)
 
     def _mcp_notifications_initialized(self, _meta: dict | None = None) -> None:
         """MCP notifications/initialized method"""
+
+    def _mcp_notifications_cancelled(self, requestId: int | str, reason: str | None = None, _meta: dict | None = None) -> None:
+        """MCP notifications/cancelled method"""
+        key = (self.get_current_transport_session_id(), requestId)
+        with self._pending_requests_lock:
+            event = self._pending_requests.get(key)
+        if event is not None:
+            event.set()
 
     def _enumerate_resources(self):
         for name, func in self.resources.methods.items():

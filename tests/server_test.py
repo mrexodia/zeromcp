@@ -114,6 +114,46 @@ def test_protocol_version_header_validation():
     print("✓ PASS")
 
 
+def test_cancelled_helper():
+    print("Testing cancellation helper...")
+    import threading
+    import time
+
+    server = McpServer("cancel-test")
+    started = threading.Event()
+    result = {}
+
+    @server.tool
+    def slow_tool():
+        started.set()
+        while True:
+            server.check_cancelled()
+            time.sleep(0.01)
+
+    def call_tool():
+        result["response"] = server.registry.dispatch({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "slow_tool", "arguments": {}},
+            "id": 1,
+        })
+
+    thread = threading.Thread(target=call_tool, daemon=True)
+    thread.start()
+    assert started.wait(2), "tool should have started"
+
+    server.registry.dispatch({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": 1},
+    })
+    thread.join(2)
+
+    assert not thread.is_alive(), "tool should stop after cancellation"
+    assert result["response"]["error"]["code"] == -32800
+    print("✓ PASS")
+
+
 def test_cors_permissive():
     print("Testing CORS permissive (cors_allowed_origins='*')...")
     with run_server(cors_allowed_origins="*") as (base_url, _):
@@ -400,6 +440,7 @@ def run_all_tests():
         test_streamable_http_notifications_have_no_body()
         test_streamable_http_accepts_client_response()
         test_protocol_version_header_validation()
+        test_cancelled_helper()
         test_cors_permissive()
         test_cors_restrictive()
         test_cors_local()
