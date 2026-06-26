@@ -1,6 +1,8 @@
+import json
 import requests
 import sys
 import socket
+import zlib
 from contextlib import contextmanager
 from zeromcp import McpServer
 
@@ -119,6 +121,22 @@ def test_body_limit():
         assert resp.status_code == 413, "Large request should fail with 413"
         assert "Payload Too Large" in resp.text, "Error message should mention payload size"
     print("✓ PASS")
+
+
+def test_compressed_body_limit():
+    print("Testing compressed body limit...")
+    with run_server(post_body_limit=100) as (base_url, _):
+        headers = {"Content-Encoding": "deflate", "Content-Type": "application/json"}
+        small = zlib.compress(json.dumps(PING_JSON).encode("utf-8"))
+        resp = requests.post(f"{base_url}/mcp", headers=headers, data=small)
+        assert resp.status_code == 200, "Small compressed request should pass"
+
+        compressed_bomb = zlib.compress(b"x" * 1000)
+        resp = requests.post(f"{base_url}/mcp", headers=headers, data=compressed_bomb)
+        assert resp.status_code == 413, "Compressed payload should fail after exceeding decompressed limit"
+        assert "Payload Too Large" in resp.text, "Error message should mention payload size"
+    print("✓ PASS")
+
 
 def test_exception_redaction():
     print("Testing exception redaction...")
@@ -246,6 +264,7 @@ def run_all_tests():
         test_dns_rebinding_host_header()
         test_cors_list()
         test_body_limit()
+        test_compressed_body_limit()
         test_exception_redaction()
         test_exception_exposure()
         test_http_errors()
