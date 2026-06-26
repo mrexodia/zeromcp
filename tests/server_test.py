@@ -29,6 +29,91 @@ def run_server(name="test", **kwargs):
 
 PING_JSON = {"jsonrpc": "2.0", "method": "ping", "id": 1}
 
+
+def test_streamable_http_session_id():
+    print("Testing Streamable HTTP session ID...")
+    initialize = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"},
+        },
+        "id": 1,
+    }
+
+    with run_server() as (base_url, server):
+        resp = requests.post(f"{base_url}/mcp", json=initialize)
+        session_id = resp.headers.get("Mcp-Session-Id")
+        assert session_id, "initialize should return Mcp-Session-Id"
+        assert not server.has_http_session(session_id), "server should not retain sessions unless enforcement is enabled"
+        assert resp.json()["result"]["protocolVersion"] == "2024-11-05"
+
+    with run_server(require_streamable_http_session=True) as (base_url, server):
+        bad_session_id = "bad-init-session"
+        resp = requests.post(
+            f"{base_url}/mcp",
+            headers={"Mcp-Session-Id": bad_session_id},
+            json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
+        )
+        assert "error" in resp.json(), "malformed initialize should fail"
+        assert not server.has_http_session(bad_session_id), "failed initialize should not register session ID"
+        resp = requests.post(f"{base_url}/mcp", headers={"Mcp-Session-Id": bad_session_id}, json=PING_JSON)
+        assert resp.status_code == 404, "failed initialize session ID should not be accepted"
+
+        resp = requests.post(f"{base_url}/mcp", json=initialize)
+        session_id = resp.headers.get("Mcp-Session-Id")
+        assert session_id, "initialize should return Mcp-Session-Id"
+        assert server.has_http_session(session_id), "server should remember session ID when enforcement is enabled"
+    print("✓ PASS")
+
+
+def test_streamable_http_notifications_have_no_body():
+    print("Testing Streamable HTTP notification response...")
+    with run_server() as (base_url, _):
+        resp = requests.post(f"{base_url}/mcp", json={
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        })
+        assert resp.status_code == 202
+        assert resp.content == b""
+    print("✓ PASS")
+
+
+def test_streamable_http_accepts_client_response():
+    print("Testing Streamable HTTP client response input...")
+    with run_server() as (base_url, _):
+        resp = requests.post(f"{base_url}/mcp", json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {},
+        })
+        assert resp.status_code == 202
+        assert resp.content == b""
+    print("✓ PASS")
+
+
+def test_protocol_version_header_validation():
+    print("Testing protocol version header validation...")
+    with run_server() as (base_url, _):
+        for version in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"):
+            resp = requests.post(
+                f"{base_url}/mcp",
+                headers={"MCP-Protocol-Version": version},
+                json=PING_JSON,
+            )
+            assert resp.status_code == 200, f"{version} should be accepted"
+
+        resp = requests.post(
+            f"{base_url}/mcp",
+            headers={"MCP-Protocol-Version": "1900-01-01"},
+            json=PING_JSON,
+        )
+        assert resp.status_code == 400
+    print("✓ PASS")
+
+
 def test_cors_permissive():
     print("Testing CORS permissive (cors_allowed_origins='*')...")
     with run_server(cors_allowed_origins="*") as (base_url, _):
@@ -311,6 +396,10 @@ def run_all_tests():
     print("="*60)
 
     try:
+        test_streamable_http_session_id()
+        test_streamable_http_notifications_have_no_body()
+        test_streamable_http_accepts_client_response()
+        test_protocol_version_header_validation()
         test_cors_permissive()
         test_cors_restrictive()
         test_cors_local()

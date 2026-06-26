@@ -16,6 +16,11 @@ from io import BufferedIOBase
 
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException
 
+MCP_PROTOCOL_VERSION = "2025-06-18"
+STREAMABLE_HTTP_PROTOCOL_VERSIONS = {"2025-03-26", MCP_PROTOCOL_VERSION, "2025-11-25"}
+LEGACY_SSE_PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_PROTOCOL_VERSIONS = STREAMABLE_HTTP_PROTOCOL_VERSIONS | {LEGACY_SSE_PROTOCOL_VERSION}
+
 class McpToolError(Exception):
     def __init__(self, message: str):
         super().__init__(message)
@@ -315,19 +320,25 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Missing ?session for SSE POST")
             return
 
-        # Dispatch to MCP registry
-        setattr(self.mcp_server._protocol_version, "data", "2024-11-05")
-        response = self.mcp_server.registry.dispatch(body)
+        # Validate the SSE session before dispatching; otherwise a tool can run
+        # with nowhere to send its response.
+        sse_conn = self.mcp_server._sse_connections.get(session_id)
+        if sse_conn is None or not sse_conn.alive:
+            self.send_error(400, f"No active SSE connection found for session {session_id}")
+            return
 
-        # Send SSE response if necessary
+        # Dispatch to MCP registry.
+        setattr(self.mcp_server._protocol_version, "data", LEGACY_SSE_PROTOCOL_VERSION)
+        setattr(self.mcp_server._transport_session_id, "data", f"sse:{session_id}")
+        try:
+            response = self.mcp_server.registry.dispatch(body)
+        finally:
+            setattr(self.mcp_server._protocol_version, "data", None)
+            setattr(self.mcp_server._transport_session_id, "data", None)
+
+        # Send SSE response if necessary.
         if response is not None:
-            sse_conn = self.mcp_server._sse_connections.get(session_id)
-            if sse_conn is None or not sse_conn.alive:
-                # No SSE connection found
-                self.send_error(400, f"No active SSE connection found for session {session_id}")
-                return
-
-            # Send response via SSE event stream
+            # Send response via SSE event stream.
             sse_conn.send_event("message", response)
 
         # Return 202 Accepted to acknowledge POST
@@ -339,21 +350,84 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_mcp_post(self, body: bytes):
-        # Dispatch to MCP registry
-        setattr(self.mcp_server._protocol_version, "data", "2025-06-18")
-        response = self.mcp_server.registry.dispatch(body)
+        protocol_version = self.headers.get("MCP-Protocol-Version")
+        if protocol_version is not None and protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+            self.send_error(400, "Unsupported MCP-Protocol-Version")
+            return
 
-        def send_response(status: int, body: bytes):
+        parsed = None
+        request_method: str | None = None
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                method = parsed.get("method")
+                if isinstance(method, str):
+                    request_method = method
+        except Exception:
+            pass
+
+        requested_protocol_version = None
+        if request_method == "initialize" and isinstance(parsed, dict):
+            params = parsed.get("params")
+            if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
+                requested_protocol_version = params["protocolVersion"]
+
+        mcp_session_id = self.headers.get("Mcp-Session-Id")
+        response_session_id = mcp_session_id
+        if request_method == "initialize":
+            if mcp_session_id is None:
+                mcp_session_id = str(uuid.uuid4())
+                response_session_id = None
+        elif self.mcp_server.require_streamable_http_session:
+            if mcp_session_id is None:
+                self.send_error(400, "Missing Mcp-Session-Id")
+                return
+            if not self.mcp_server.has_http_session(mcp_session_id):
+                self.send_error(404, "Session not found")
+                return
+
+        def send_response(status: int, response_body: bytes):
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Length", str(len(response_body)))
+            if response_session_id is not None:
+                self.send_header("Mcp-Session-Id", response_session_id)
             self.send_cors_headers()
             self.end_headers()
-            self.wfile.write(body)
+            if response_body:
+                self.wfile.write(response_body)
+
+        # JSON-RPC responses sent by clients are accepted; this server does not issue client requests.
+        if isinstance(parsed, dict) and request_method is None and "id" in parsed and ("result" in parsed or "error" in parsed):
+            send_response(202, b"")
+            return
+
+        active_protocol_version = protocol_version or MCP_PROTOCOL_VERSION
+        if request_method == "initialize" and protocol_version is None:
+            active_protocol_version = requested_protocol_version if requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+
+        # Dispatch to MCP registry.
+        setattr(self.mcp_server._protocol_version, "data", active_protocol_version)
+        setattr(
+            self.mcp_server._transport_session_id,
+            "data",
+            f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous",
+        )
+        try:
+            response = self.mcp_server.registry.dispatch(body)
+        finally:
+            setattr(self.mcp_server._protocol_version, "data", None)
+            setattr(self.mcp_server._transport_session_id, "data", None)
+
+        if request_method == "initialize" and response is not None and "error" not in response:
+            assert mcp_session_id is not None
+            response_session_id = mcp_session_id
+            if self.mcp_server.require_streamable_http_session:
+                self.mcp_server.register_http_session(mcp_session_id)
 
         # Check if notification (returns None)
         if response is None:
-            send_response(202, b"Accepted")
+            send_response(202, b"")
         else:
             send_response(200, json.dumps(response).encode("utf-8"))
 
@@ -371,7 +445,11 @@ class McpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
+        self._http_sessions: set[str] = set()
+        self._http_sessions_lock = threading.Lock()
         self._protocol_version = threading.local()
+        self._transport_session_id = threading.local()
+        self.require_streamable_http_session = False
 
         # Register MCP protocol methods with correct names
         self.registry = JsonRpcRegistry()
@@ -384,6 +462,7 @@ class McpServer:
         self.registry.methods["resources/read"] = self._mcp_resources_read
         self.registry.methods["prompts/list"] = self._mcp_prompts_list
         self.registry.methods["prompts/get"] = self._mcp_prompts_get
+        self.registry.methods["notifications/initialized"] = self._mcp_notifications_initialized
 
     def tool(self, func: Callable) -> Callable:
         return self.tools.method(func)
@@ -483,12 +562,31 @@ class McpServer:
                 if not request:
                     continue
 
-                response = self.registry.dispatch(request)
+                setattr(self._transport_session_id, "data", "stdio:default")
+                try:
+                    response = self.registry.dispatch(request)
+                finally:
+                    setattr(self._transport_session_id, "data", None)
                 if response is not None:
                     stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                     stdout.flush()
             except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
                 break
+
+    def get_current_transport_session_id(self) -> str | None:
+        return getattr(self._transport_session_id, "data", None)
+
+    def register_http_session(self, session_id: str) -> None:
+        with self._http_sessions_lock:
+            self._http_sessions.add(session_id)
+
+    def has_http_session(self, session_id: str) -> bool:
+        with self._http_sessions_lock:
+            return session_id in self._http_sessions
+
+    def unregister_http_session(self, session_id: str) -> None:
+        with self._http_sessions_lock:
+            self._http_sessions.discard(session_id)
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""
@@ -551,6 +649,9 @@ class McpServer:
             "structuredContent": result if isinstance(result, dict) else {"result": result},
             "isError": False,
         }
+
+    def _mcp_notifications_initialized(self, _meta: dict | None = None) -> None:
+        """MCP notifications/initialized method"""
 
     def _enumerate_resources(self):
         for name, func in self.resources.methods.items():
