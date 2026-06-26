@@ -1,5 +1,6 @@
 import json
 import inspect
+import threading
 import traceback
 from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
@@ -34,7 +35,11 @@ class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
         self._cache: dict[Callable, tuple[inspect.Signature, dict, list[str]]] = {}
+        self._current_request = threading.local()
         self.redact_exceptions = False
+
+    def current_request_id(self) -> JsonRpcId:
+        return getattr(self._current_request, "id", None)
 
     def method(self, func: Callable, name: str | None = None) -> Callable:
         self.methods[name or func.__name__] = func # type: ignore
@@ -61,6 +66,8 @@ class JsonRpcRegistry:
         request_id: JsonRpcId = request.get("id")
         is_notification = "id" not in request
         params: JsonRpcParams = request.get("params")
+        previous_id = self.current_request_id()
+        self._current_request.id = request_id
         try:
             result = self._call(method, params)
             if is_notification:
@@ -79,6 +86,8 @@ class JsonRpcRegistry:
                 return None
             error = self.map_exception(e)
             return self._error(request_id, error["code"], error["message"], error.get("data"))
+        finally:
+            self._current_request.id = previous_id
 
     def map_exception(self, e: Exception) -> JsonRpcError:
         if self.redact_exceptions:

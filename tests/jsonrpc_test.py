@@ -158,6 +158,40 @@ def test_rpc(request: Any, expected_response: dict | None = None, description: s
     return result
 
 
+def test_current_request_id_is_stack_safe():
+    print(f"\n{'='*60}")
+    print("Test: current_request_id is restored across nested dispatch")
+
+    registry = JsonRpcRegistry()
+    seen = []
+
+    @registry.method
+    def inner():
+        seen.append(("inner", registry.current_request_id()))
+        return "ok"
+
+    @registry.method
+    def outer():
+        seen.append(("outer_before", registry.current_request_id()))
+        response = registry.dispatch({"jsonrpc": "2.0", "method": "inner", "id": "inner-id"})
+        seen.append(("outer_after", registry.current_request_id()))
+        assert response is not None
+        return response["result"]
+
+    result = registry.dispatch({"jsonrpc": "2.0", "method": "outer", "id": "outer-id"})
+    expected_seen = [
+        ("outer_before", "outer-id"),
+        ("inner", "inner-id"),
+        ("outer_after", "outer-id"),
+    ]
+    if result != {"jsonrpc": "2.0", "result": "ok", "id": "outer-id"} or seen != expected_seen or registry.current_request_id() is not None:
+        print("❌ FAIL: current_request_id was not restored correctly")
+        print(f"Result: {result}")
+        print(f"Seen: {seen}")
+        sys.exit(1)
+    print("✓ PASS")
+
+
 def run_all_tests():
     print("="*60)
     print("JSON-RPC 2.0 COMPLIANCE TESTS")
@@ -544,6 +578,8 @@ def run_all_tests():
         None,
         "Notification - method that raises python exception"
     )
+
+    test_current_request_id_is_stack_safe()
 
     print("\n" + "="*60)
     print("ALL TESTS PASSED! ✓")
