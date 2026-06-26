@@ -158,15 +158,21 @@ async def test_edge_cases(prefix: str, session: ClientSession):
     """Test edge cases and error conditions"""
     await session.initialize()
 
-    # Test non-existent tool
-    result = await session.call_tool("nonexistent_tool", arguments={})
-    assert result.isError, "should error on non-existent tool"
-    print(f"[{prefix}] Non-existent tool error: {result.content[0] if result.content else 'no content'}")
+    # Test non-existent tool (protocol error)
+    try:
+        await session.call_tool("nonexistent_tool", arguments={})
+        assert False, "should have raised on non-existent tool"
+    except McpError as e:
+        assert "not found" in e.error.message, "expected method not found error"
+        print(f"[{prefix}] Non-existent tool error: {e.error.message}")
 
-    # Test missing required parameter
-    result = await session.call_tool("divide", arguments={"numerator": 42})
-    assert result.isError, "should error on missing denominator"
-    print(f"[{prefix}] Missing param error: {result.content[0] if result.content else 'no content'}")
+    # Test missing required parameter (protocol error)
+    try:
+        await session.call_tool("divide", arguments={"numerator": 42})
+        assert False, "should have raised on missing denominator"
+    except McpError as e:
+        assert "missing required" in e.error.message, "expected missing parameter error"
+        print(f"[{prefix}] Missing param error: {e.error.message}")
 
     # Test division by zero (natural exception)
     result = await session.call_tool("divide", arguments={"numerator": 1, "denominator": 0})

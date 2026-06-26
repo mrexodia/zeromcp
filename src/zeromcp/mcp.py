@@ -623,7 +623,7 @@ class McpServer:
             },
         }
 
-    def _mcp_tools_list(self, _meta: dict | None = None) -> dict:
+    def _mcp_tools_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/list method"""
         return {
             "tools": [
@@ -650,14 +650,14 @@ class McpServer:
                 "jsonrpc": "2.0",
                 "method": name,
                 "params": arguments,
-                "id": None,
+                "id": 0,
             })
             assert tool_response is not None, "Only notification requests return None"
 
-            # Check for error response
+            # Unknown tools, invalid arguments, and cancellation are protocol errors.
             if "error" in tool_response:
                 error = tool_response["error"]
-                if error["code"] == -32800:
+                if error["code"] in (-32601, -32602, -32800):
                     raise JsonRpcException(error["code"], error["message"], error.get("data"))
                 return {
                     "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
@@ -666,11 +666,14 @@ class McpServer:
 
             result = tool_response.get("result")
             content = result if isinstance(result, str) else json.dumps(result, indent=2)
-            return {
+            mcp_result = {
                 "content": [{"type": "text", "text": content}],
-                "structuredContent": result if isinstance(result, dict) else {"result": result},
                 "isError": False,
             }
+            structured_content = self._structured_content_for_tool(name, result)
+            if structured_content is not None:
+                mcp_result["structuredContent"] = structured_content
+            return mcp_result
         finally:
             if request_id is not None:
                 with self._pending_requests_lock:
@@ -688,13 +691,24 @@ class McpServer:
         if event is not None:
             event.set()
 
+    def _structured_content_for_tool(self, name: str, result: Any) -> dict | None:
+        func = self.tools.methods.get(name)
+        if func is not None:
+            return_type = get_type_hints(func, include_extras=True).get("return")
+            if self._type_is_plain_str(return_type):
+                return None
+            if return_type and return_type is not type(None) and return_type is not Any:
+                if not self._schema_is_object_like(self._type_to_json_schema(return_type)):
+                    return {"result": result}
+        return result if isinstance(result, dict) else {"result": result}
+
     def _enumerate_resources(self):
         for name, func in self.resources.methods.items():
             uri: str = getattr(func, "__resource_uri__")
             description = (func.__doc__ or f"Read {uri}").strip()
             yield uri, name, description
 
-    def _mcp_resources_list(self, _meta: dict | None = None) -> dict:
+    def _mcp_resources_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
         """MCP resources/list method - returns static resources only (no URI parameters)"""
         return {
             "resources": [
@@ -709,7 +723,7 @@ class McpServer:
             ]
         }
 
-    def _mcp_resource_templates_list(self, _meta: dict | None = None) -> dict:
+    def _mcp_resource_templates_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
         """MCP resources/templates/list method - returns parameterized resource templates"""
         return {
             "resourceTemplates": [
@@ -742,7 +756,7 @@ class McpServer:
                     "jsonrpc": "2.0",
                     "method": name,
                     "params": params,
-                    "id": None,
+                    "id": 0,
                 })
                 assert resource_response is not None, "Only notification requests return None"
 
@@ -760,7 +774,7 @@ class McpServer:
 
         raise JsonRpcException(-32002, "Resource not found", {"uri": uri})
 
-    def _mcp_prompts_list(self, _meta: dict | None = None) -> dict:
+    def _mcp_prompts_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
         """MCP prompts/list method"""
         return {
             "prompts": [
@@ -779,7 +793,7 @@ class McpServer:
                 "jsonrpc": "2.0",
                 "method": name,
                 "params": arguments,
-                "id": None,
+                "id": 0,
             }
         )
         assert prompt_response is not None, "Only notification requests return None"
@@ -841,8 +855,25 @@ class McpServer:
 
         return schema
 
+    def _schema_is_object_like(self, schema: dict) -> bool:
+        if schema.get("type") == "object":
+            return True
+        if "anyOf" in schema:
+            return all(self._schema_is_object_like(s) for s in schema["anyOf"])
+        return False
+
+    def _type_is_plain_str(self, py_type: Any) -> bool:
+        if py_type is str:
+            return True
+        if get_origin(py_type) is Annotated:
+            return self._type_is_plain_str(get_args(py_type)[0])
+        return False
+
     def _type_to_json_schema(self, py_type: Any) -> dict:
         """Convert Python type hint to JSON schema object"""
+        if py_type is Any:
+            return {}
+
         origin = get_origin(py_type)
         # Annotated[T, "description"]
         if origin is Annotated:
@@ -923,6 +954,13 @@ class McpServer:
             param = sig.parameters.get(param_name)
             if not param or param.default is inspect.Parameter.empty:
                 required.append(param_name)
+            else:
+                try:
+                    json.dumps(param.default)
+                except TypeError:
+                    pass
+                else:
+                    properties[param_name]["default"] = param.default
 
         schema: dict[str, Any] = {
             "name": func_name,
@@ -934,17 +972,19 @@ class McpServer:
             },
         }
 
-        # Add outputSchema if return type exists and is not None
-        if return_type and return_type is not type(None):
+        # Add outputSchema if return type exists and is not None/Any/text-only
+        if return_type and return_type is not type(None) and return_type is not Any and not self._type_is_plain_str(return_type):
             return_schema = self._type_to_json_schema(return_type)
 
-            # Wrap non-object returns in a "result" property
-            if return_schema.get("type") != "object":
+            # Wrap non-object returns in a "result" property.
+            if not self._schema_is_object_like(return_schema):
                 return_schema = {
                     "type": "object",
                     "properties": {"result": return_schema},
                     "required": ["result"],
                 }
+            elif return_schema.get("type") != "object":
+                return_schema = {"type": "object", **return_schema}
 
             schema["outputSchema"] = return_schema
 

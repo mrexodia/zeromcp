@@ -114,6 +114,65 @@ def test_protocol_version_header_validation():
     print("✓ PASS")
 
 
+def test_tool_protocol_errors():
+    print("Testing tool protocol errors...")
+    with run_server() as (base_url, _):
+        resp = requests.post(f"{base_url}/mcp", json={
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "missing_tool", "arguments": {}},
+            "id": 1,
+        })
+        data = resp.json()
+        assert data["error"]["code"] == -32601
+    print("✓ PASS")
+
+
+def test_str_tool_result_is_unstructured_text():
+    print("Testing string tool results are unstructured text...")
+    server = McpServer("text-test")
+
+    @server.tool
+    def text_tool() -> str:
+        return "hello \"world\"\nline2"
+
+    list_response = server.registry.dispatch({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert list_response is not None
+    tool_schema = list_response["result"]["tools"][0]
+    assert "outputSchema" not in tool_schema, "str return tools should not advertise structured output"
+
+    call_response = server.registry.dispatch({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "text_tool", "arguments": {}},
+        "id": 2,
+    })
+    assert call_response is not None
+    result = call_response["result"]
+    assert result["content"] == [{"type": "text", "text": "hello \"world\"\nline2"}]
+    assert "structuredContent" not in result, "str return tools should not include structuredContent"
+    print("✓ PASS")
+
+
+def test_list_cursor_params_are_accepted():
+    print("Testing list cursor params...")
+    with run_server() as (base_url, _):
+        for method in ("tools/list", "resources/list", "resources/templates/list", "prompts/list"):
+            resp = requests.post(f"{base_url}/mcp", json={
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": {"cursor": "ignored"},
+                "id": 1,
+            })
+            assert resp.status_code == 200
+            assert "result" in resp.json(), f"{method} should accept cursor"
+    print("✓ PASS")
+
+
 def test_cancelled_helper():
     print("Testing cancellation helper...")
     import threading
@@ -440,6 +499,9 @@ def run_all_tests():
         test_streamable_http_notifications_have_no_body()
         test_streamable_http_accepts_client_response()
         test_protocol_version_header_validation()
+        test_tool_protocol_errors()
+        test_str_tool_result_is_unstructured_text()
+        test_list_cursor_params_are_accepted()
         test_cancelled_helper()
         test_cors_permissive()
         test_cors_restrictive()
