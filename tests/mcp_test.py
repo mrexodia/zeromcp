@@ -38,7 +38,16 @@ async def test_example_server(prefix: str, session: ClientSession):
     tools = await session.list_tools()
     print(f"[{prefix}] Available tools: {[t.name for t in tools.tools]}")
     tool_names = {t.name for t in tools.tools}
-    assert tool_names == {"divide", "greet", "random_dict", "get_system_info", "failing_tool", "struct_get"}, f"unexpected tools: {tool_names}"
+    assert tool_names == {
+        "divide",
+        "echo",
+        "slow_count",
+        "greet",
+        "random_dict",
+        "get_system_info",
+        "failing_tool",
+        "struct_get",
+    }, f"unexpected tools: {tool_names}"
 
     # List available prompts
     prompts = await session.list_prompts()
@@ -91,6 +100,12 @@ async def test_example_server(prefix: str, session: ClientSession):
     assert isinstance(result_unstructured, types.TextContent), "expected TextContent"
     print(f"[{prefix}] Divide result: {result_unstructured.text}")
     assert "21" in result_unstructured.text, "42/2 should be 21"
+
+    # Call echo tool
+    result = await session.call_tool("echo", arguments={"text": "hello \"world\"\nline2"})
+    assert not result.isError, "echo should succeed"
+    assert isinstance(result.content[0], types.TextContent), "expected TextContent"
+    assert result.content[0].text == "hello \"world\"\nline2", "expected exact text"
 
     # Call greet tool without age
     result = await session.call_tool("greet", arguments={"name": "Alice"})

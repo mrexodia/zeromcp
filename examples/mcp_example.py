@@ -60,6 +60,21 @@ def get_system_info() -> SystemInfo:
 
 
 @mcp.tool
+def echo(text: Annotated[str, "Text to echo verbatim"]) -> str:
+    """Return text verbatim"""
+    return text
+
+
+@mcp.tool
+def slow_count(limit: Annotated[int, "How high to count"] = 10) -> str:
+    """Long-running tool that supports cancellation"""
+    for _ in range(limit):
+        mcp.check_cancelled()
+        time.sleep(1)
+    return f"Counted to {limit}"
+
+
+@mcp.tool
 def failing_tool(message: Annotated[str, "Error message to raise"]) -> str:
     """Tool that always fails (for testing error handling)"""
     raise McpToolError(message)
@@ -145,6 +160,12 @@ if __name__ == "__main__":
         help="Transport (stdio or http://host:port)",
         default="http://127.0.0.1:5001",
     )
+    parser.add_argument(
+        "--cors-origin",
+        action="append",
+        dest="cors_origins",
+        help="Allowed browser CORS origin. Repeat for multiple origins, or use '*' for local testing.",
+    )
     args = parser.parse_args()
     if args.transport == "stdio":
         mcp.stdio()
@@ -153,7 +174,12 @@ if __name__ == "__main__":
         if url.hostname is None or url.port is None:
             raise Exception(f"Invalid transport URL: {args.transport}")
 
+        if args.cors_origins:
+            mcp.cors_allowed_origins = "*" if "*" in args.cors_origins else args.cors_origins
+
         print("Starting MCP Example Server...")
+        if args.cors_origins:
+            print(f"CORS origins: {mcp.cors_allowed_origins}")
 
         print("\nAvailable tools:")
         for name in mcp.tools.methods.keys():
