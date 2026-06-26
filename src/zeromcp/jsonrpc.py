@@ -5,7 +5,7 @@ import traceback
 from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
 
-JsonRpcId: TypeAlias = str | int | float | None
+JsonRpcId: TypeAlias = str | int | None
 JsonRpcParams: TypeAlias = dict[str, Any] | list[Any] | None
 
 class JsonRpcRequest(TypedDict):
@@ -65,6 +65,9 @@ class JsonRpcRegistry:
 
         request_id: JsonRpcId = request.get("id")
         is_notification = "id" not in request
+        if not is_notification and type(request_id) not in (int, str, type(None)):
+            return self._error(None, -32600, "Invalid request: 'id' must be a string, integer, or null")
+
         params: JsonRpcParams = request.get("params")
         previous_id = self.current_request_id()
         self._current_request.id = request_id

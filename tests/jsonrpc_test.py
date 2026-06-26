@@ -315,6 +315,18 @@ def run_all_tests():
         "Valid request with id: null"
     )
 
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "foobar", "id": 1.5}',
+        {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'id' must be a string, integer, or null"}, "id": None},
+        "Invalid request with float id"
+    )
+
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "foobar", "id": true}',
+        {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'id' must be a string, integer, or null"}, "id": None},
+        "Invalid request with boolean id"
+    )
+
     # ========================================
     # PARAMETER VALIDATION TESTS
     # ========================================
