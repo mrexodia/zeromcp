@@ -8,8 +8,12 @@ import ipaddress
 import inspect
 import threading
 import traceback
+import asyncio
+import contextvars
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
-from typing import Any, Callable, Union, Annotated, BinaryIO, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
+from typing import Any, Callable, Union, Annotated, BinaryIO, Mapping, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
@@ -20,6 +24,29 @@ MCP_PROTOCOL_VERSION = "2025-06-18"
 STREAMABLE_HTTP_PROTOCOL_VERSIONS = {"2025-03-26", MCP_PROTOCOL_VERSION, "2025-11-25"}
 LEGACY_SSE_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = STREAMABLE_HTTP_PROTOCOL_VERSIONS | {LEGACY_SSE_PROTOCOL_VERSION}
+
+@dataclass(frozen=True)
+class McpAuthInfo:
+    subject: str | None = None
+    scopes: frozenset[str] = field(default_factory=frozenset)
+    claims: Mapping[str, Any] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class McpRequestContext:
+    request_id: int | str | None = None
+    meta: dict[str, Any] | None = None
+    auth: McpAuthInfo | None = None
+    protocol_version: str | None = None
+    transport_session_id: str | None = None
+
+@dataclass(frozen=True)
+class McpOAuthConfig:
+    resource: str
+    authorization_servers: tuple[str, ...]
+    verify_token: Callable[[str, str], McpAuthInfo | None]
+    scopes_supported: tuple[str, ...] = ()
+    required_scopes: tuple[str, ...] = ()
+    resource_metadata_url: str | None = None
 
 class McpToolError(Exception):
     def __init__(self, message: str):
@@ -134,9 +161,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         if not _origin_allowed_by_policy(self.mcp_server.cors_allowed_origins, origin):
             return
         self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id, MCP-Protocol-Version, WWW-Authenticate")
         if preflight:
             self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, MCP-Protocol-Version")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, Authorization, X-Requested-With, Mcp-Session-Id, MCP-Protocol-Version")
             if self.headers.get("Access-Control-Request-Private-Network") == "true":
                 self.send_header("Access-Control-Allow-Private-Network", "true")
 
@@ -148,6 +176,90 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.send_cors_headers()
         self.end_headers()
         self.wfile.write(f"{message}\n".encode("utf-8"))
+
+    def _quote_auth_param(self, value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    def _oauth_resource_metadata_url(self) -> str:
+        config = self.mcp_server._oauth_config
+        if config is not None and config.resource_metadata_url is not None:
+            return config.resource_metadata_url
+        host = self.headers.get("Host")
+        if not host:
+            server_address = getattr(self.server, "server_address", ("127.0.0.1", 0))
+            host = f"{server_address[0]}:{server_address[1]}" if isinstance(server_address, tuple) else "127.0.0.1"
+        scheme = self.headers.get("X-Forwarded-Proto", "http").split(",", 1)[0].strip() or "http"
+        return f"{scheme}://{host}/.well-known/oauth-protected-resource"
+
+    def _send_oauth_error(self, status: int, message: str, *, error: str | None = None, scope: str | None = None) -> None:
+        challenge = f'Bearer resource_metadata="{self._quote_auth_param(self._oauth_resource_metadata_url())}"'
+        if error is not None:
+            challenge += f', error="{self._quote_auth_param(error)}"'
+        if scope is not None:
+            challenge += f', scope="{self._quote_auth_param(scope)}"'
+
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("WWW-Authenticate", challenge)
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(f"{message}\n".encode("utf-8"))
+
+    def _check_oauth_for_path(self, path: str) -> tuple[bool, McpAuthInfo | None]:
+        if path not in ("/sse", "/mcp"):
+            return True, None
+        return self._check_oauth()
+
+    def _check_oauth(self) -> tuple[bool, McpAuthInfo | None]:
+        config = self.mcp_server._oauth_config
+        if config is None:
+            return True, None
+
+        auth = self.headers.get("Authorization", "")
+        scheme, _, token = auth.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            self._send_oauth_error(401, "Authorization required", scope=" ".join(config.required_scopes) or None)
+            return False, None
+
+        try:
+            auth_info = config.verify_token(token.strip(), config.resource)
+        except Exception:
+            auth_info = None
+        if auth_info is None:
+            self._send_oauth_error(401, "Invalid access token", error="invalid_token", scope=" ".join(config.required_scopes) or None)
+            return False, None
+
+        missing_scopes = set(config.required_scopes) - set(auth_info.scopes)
+        if missing_scopes:
+            self._send_oauth_error(403, "Insufficient scope", error="insufficient_scope", scope=" ".join(config.required_scopes))
+            return False, None
+
+        return True, auth_info
+
+    def _is_oauth_metadata_path(self, path: str) -> bool:
+        return path == "/.well-known/oauth-protected-resource" or path.startswith("/.well-known/oauth-protected-resource/")
+
+    def _handle_oauth_protected_resource_metadata(self) -> None:
+        config = self.mcp_server._oauth_config
+        if config is None:
+            self.send_error(404, "Not Found")
+            return
+
+        metadata: dict[str, Any] = {
+            "resource": config.resource,
+            "authorization_servers": list(config.authorization_servers),
+            "bearer_methods_supported": ["header"],
+        }
+        if config.scopes_supported:
+            metadata["scopes_supported"] = list(config.scopes_supported)
+
+        body = json.dumps(metadata).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
 
     def handle(self):
         """Override to add error handling for connection errors"""
@@ -173,9 +285,18 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._check_api_request():
             return
-        match urlparse(self.path).path:
+        path = urlparse(self.path).path
+        if self._is_oauth_metadata_path(path):
+            self._handle_oauth_protected_resource_metadata()
+            return
+
+        ok, auth_info = self._check_oauth_for_path(path)
+        if not ok:
+            return
+
+        match path:
             case "/sse":
-                self._handle_sse_get()
+                self._handle_sse_get(auth_info)
             case "/mcp":
                 self.send_error(405, "Method Not Allowed")
             case _:
@@ -184,15 +305,21 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._check_api_request():
             return
+
+        path = urlparse(self.path).path
+        ok, auth_info = self._check_oauth_for_path(path)
+        if not ok:
+            return
+
         body = self._read_body()
         if body is None:
             return
 
-        match urlparse(self.path).path:
+        match path:
             case "/sse":
-                self._handle_sse_post(body)
+                self._handle_sse_post(body, auth_info)
             case "/mcp":
-                self._handle_mcp_post(body)
+                self._handle_mcp_post(body, auth_info)
             case _:
                 self.send_error(404, "Not Found")
 
@@ -206,6 +333,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         if not self._check_api_request():
+            return
+        ok, _ = self._check_oauth_for_path(urlparse(self.path).path)
+        if not ok:
             return
         self.send_error(405, "Method Not Allowed")
 
@@ -281,7 +411,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return None
         return data
 
-    def _handle_sse_get(self):
+    def _handle_sse_get(self, auth_info: McpAuthInfo | None = None):
         # Create SSE connection wrapper
         conn = _McpSseConnection(self.wfile)
         self.mcp_server._sse_connections[conn.session_id] = conn
@@ -313,7 +443,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             if conn.session_id in self.mcp_server._sse_connections:
                 del self.mcp_server._sse_connections[conn.session_id]
 
-    def _handle_sse_post(self, body: bytes):
+    def _handle_sse_post(self, body: bytes, auth_info: McpAuthInfo | None = None):
         query_params = parse_qs(urlparse(self.path).query)
         session_id = query_params.get("session", [None])[0]
         if session_id is None:
@@ -328,13 +458,14 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return
 
         # Dispatch to MCP registry.
-        setattr(self.mcp_server._protocol_version, "data", LEGACY_SSE_PROTOCOL_VERSION)
-        setattr(self.mcp_server._transport_session_id, "data", f"sse:{session_id}")
-        try:
-            response = self.mcp_server.registry.dispatch(body)
-        finally:
-            setattr(self.mcp_server._protocol_version, "data", None)
-            setattr(self.mcp_server._transport_session_id, "data", None)
+        request_id = self.mcp_server._request_id_from_body(body)
+        with self.mcp_server._context_scope(
+            request_id=request_id,
+            auth=auth_info,
+            protocol_version=LEGACY_SSE_PROTOCOL_VERSION,
+            transport_session_id=f"sse:{session_id}",
+        ):
+            response = self.mcp_server._dispatch_mcp(body)
 
         # Send SSE response if necessary.
         if response is not None:
@@ -349,7 +480,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _handle_mcp_post(self, body: bytes):
+    def _handle_mcp_post(self, body: bytes, auth_info: McpAuthInfo | None = None):
         protocol_version = self.headers.get("MCP-Protocol-Version")
         if protocol_version is not None and protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
             self.send_error(400, "Unsupported MCP-Protocol-Version")
@@ -372,17 +503,16 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
                 requested_protocol_version = params["protocolVersion"]
 
-        mcp_session_id = self.headers.get("Mcp-Session-Id")
-        response_session_id = mcp_session_id
+        request_session_id = self.headers.get("Mcp-Session-Id")
+        response_session_id = request_session_id
         if request_method == "initialize":
-            if mcp_session_id is None:
-                mcp_session_id = str(uuid.uuid4())
-                response_session_id = None
+            request_session_id = request_session_id or str(uuid.uuid4())
+            response_session_id = None
         elif self.mcp_server.require_streamable_http_session:
-            if mcp_session_id is None:
+            if request_session_id is None:
                 self.send_error(400, "Missing Mcp-Session-Id")
                 return
-            if not self.mcp_server.has_http_session(mcp_session_id):
+            if not self.mcp_server.has_http_session(request_session_id):
                 self.send_error(404, "Session not found")
                 return
 
@@ -407,23 +537,20 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             active_protocol_version = requested_protocol_version if requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
 
         # Dispatch to MCP registry.
-        setattr(self.mcp_server._protocol_version, "data", active_protocol_version)
-        setattr(
-            self.mcp_server._transport_session_id,
-            "data",
-            f"http:{mcp_session_id}" if mcp_session_id else "http:anonymous",
-        )
-        try:
-            response = self.mcp_server.registry.dispatch(body)
-        finally:
-            setattr(self.mcp_server._protocol_version, "data", None)
-            setattr(self.mcp_server._transport_session_id, "data", None)
+        request_id = self.mcp_server._request_id_from_body(parsed) if isinstance(parsed, dict) else None
+        with self.mcp_server._context_scope(
+            request_id=request_id,
+            auth=auth_info,
+            protocol_version=active_protocol_version,
+            transport_session_id=f"http:{request_session_id}" if request_session_id else "http:anonymous",
+        ):
+            response = self.mcp_server._dispatch_mcp(body)
 
         if request_method == "initialize" and response is not None and "error" not in response:
-            assert mcp_session_id is not None
-            response_session_id = mcp_session_id
+            assert request_session_id is not None
+            response_session_id = request_session_id
             if self.mcp_server.require_streamable_http_session:
-                self.mcp_server.register_http_session(mcp_session_id)
+                self.mcp_server.register_http_session(request_session_id)
 
         # Check if notification (returns None)
         if response is None:
@@ -449,27 +576,104 @@ class McpServer:
         self._http_sessions_lock = threading.Lock()
         self._pending_requests: dict[tuple[str | None, int | str], threading.Event] = {}
         self._pending_requests_lock = threading.Lock()
-        self._protocol_version = threading.local()
-        self._transport_session_id = threading.local()
-        self._request_context = threading.local()
+        self._context_var: contextvars.ContextVar[McpRequestContext] = contextvars.ContextVar(
+            f"zeromcp_request_context_{id(self)}",
+            default=McpRequestContext(),
+        )
+        self._cancel_event_var: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+            f"zeromcp_cancel_event_{id(self)}",
+            default=None,
+        )
+        self._oauth_config: McpOAuthConfig | None = None
         self.require_streamable_http_session = False
 
-        # Register MCP protocol methods with correct names
+        # Register MCP protocol methods with correct names.
         self.registry = JsonRpcRegistry()
-        self.registry.methods["ping"] = self._mcp_ping
-        self.registry.methods["initialize"] = self._mcp_initialize
-        self.registry.methods["tools/list"] = self._mcp_tools_list
-        self.registry.methods["tools/call"] = self._mcp_tools_call
-        self.registry.methods["resources/list"] = self._mcp_resources_list
-        self.registry.methods["resources/templates/list"] = self._mcp_resource_templates_list
-        self.registry.methods["resources/read"] = self._mcp_resources_read
-        self.registry.methods["prompts/list"] = self._mcp_prompts_list
-        self.registry.methods["prompts/get"] = self._mcp_prompts_get
-        self.registry.methods["notifications/initialized"] = self._mcp_notifications_initialized
-        self.registry.methods["notifications/cancelled"] = self._mcp_notifications_cancelled
+        self.registry.method(self._mcp_ping, "ping")
+        self.registry.method(self._mcp_initialize, "initialize")
+        self.registry.method(self._mcp_tools_list, "tools/list")
+        self.registry.method(self._mcp_tools_call, "tools/call")
+        self.registry.method(self._mcp_resources_list, "resources/list")
+        self.registry.method(self._mcp_resource_templates_list, "resources/templates/list")
+        self.registry.method(self._mcp_resources_read, "resources/read")
+        self.registry.method(self._mcp_prompts_list, "prompts/list")
+        self.registry.method(self._mcp_prompts_get, "prompts/get")
+        self.registry.method(self._mcp_notifications_initialized, "notifications/initialized")
+        self.registry.method(self._mcp_notifications_cancelled, "notifications/cancelled")
 
-    def tool(self, func: Callable) -> Callable:
-        return self.tools.method(func)
+    @property
+    def context(self) -> McpRequestContext:
+        return self._context_var.get()
+
+    @contextmanager
+    def _context_scope(self, **updates):
+        token = self._context_var.set(replace(self.context, **updates))
+        try:
+            yield
+        finally:
+            self._context_var.reset(token)
+
+    @contextmanager
+    def _cancel_scope(self, cancel_event: threading.Event | None):
+        token = self._cancel_event_var.set(cancel_event)
+        try:
+            yield
+        finally:
+            self._cancel_event_var.reset(token)
+
+    def oauth(
+        self,
+        *,
+        resource: str,
+        authorization_servers: list[str] | tuple[str, ...],
+        scopes_supported: list[str] | tuple[str, ...] | None = None,
+        required_scopes: list[str] | tuple[str, ...] | None = None,
+        resource_metadata_url: str | None = None,
+    ) -> Callable[[Callable[[str, str], McpAuthInfo | None]], Callable[[str, str], McpAuthInfo | None]]:
+        if not authorization_servers:
+            raise ValueError("authorization_servers must not be empty")
+
+        def decorator(verify_token: Callable[[str, str], McpAuthInfo | None]) -> Callable[[str, str], McpAuthInfo | None]:
+            self._oauth_config = McpOAuthConfig(
+                resource=resource,
+                authorization_servers=tuple(authorization_servers),
+                verify_token=verify_token,
+                scopes_supported=tuple(scopes_supported or ()),
+                required_scopes=tuple(required_scopes or ()),
+                resource_metadata_url=resource_metadata_url,
+            )
+            return verify_token
+
+        return decorator
+
+    def tool(
+        self,
+        func: Callable | None = None,
+        *,
+        title: str | None = None,
+        read_only: bool | None = None,
+        destructive: bool | None = None,
+        idempotent: bool | None = None,
+        open_world: bool | None = None,
+    ) -> Callable:
+        annotations = {}
+        if title is not None:
+            annotations["title"] = title
+        if read_only is not None:
+            annotations["readOnlyHint"] = read_only
+        if destructive is not None:
+            annotations["destructiveHint"] = destructive
+        if idempotent is not None:
+            annotations["idempotentHint"] = idempotent
+        if open_world is not None:
+            annotations["openWorldHint"] = open_world
+
+        def decorator(inner: Callable) -> Callable:
+            if annotations:
+                setattr(inner, "__mcp_tool_annotations__", annotations)
+            return self.tools.method(inner)
+
+        return decorator if func is None else decorator(func)
 
     def prompt(self, func: Callable) -> Callable:
         return self.prompts.method(func)
@@ -566,24 +770,61 @@ class McpServer:
                 if not request:
                     continue
 
-                setattr(self._transport_session_id, "data", "stdio:default")
-                try:
-                    response = self.registry.dispatch(request)
-                finally:
-                    setattr(self._transport_session_id, "data", None)
+                request_id = self._request_id_from_body(request)
+                with self._context_scope(request_id=request_id, transport_session_id="stdio:default"):
+                    response = self._dispatch_mcp(request)
                 if response is not None:
                     stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                     stdout.flush()
             except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
                 break
 
+    async def stdio_async(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
+        stdin = stdin or sys.stdin.buffer
+        stdout = stdout or sys.stdout.buffer
+        write_lock = asyncio.Lock()
+        tasks: set[asyncio.Task] = set()
+
+        async def write_response(response):
+            if response is None:
+                return
+            async with write_lock:
+                stdout.write(json.dumps(response).encode("utf-8") + b"\n")
+                stdout.flush()
+
+        async def handle_request(request: bytes):
+            request_id = self._request_id_from_body(request)
+            with self._context_scope(request_id=request_id, transport_session_id="stdio:default"):
+                response = await self._dispatch_mcp_async(request)
+            await write_response(response)
+
+        while True:
+            try:
+                request = await asyncio.to_thread(stdin.readline)
+                if not request:  # EOF
+                    break
+
+                # Strip whitespace (trailing newline) before parsing
+                request = request.strip()
+                if not request:
+                    continue
+
+                task = asyncio.create_task(handle_request(request))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+            except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
+                break
+
+        if tasks:
+            await asyncio.gather(*tasks)
+
     def check_cancelled(self) -> None:
-        event = getattr(self._request_context, "cancel_event", None)
+        event = self._cancel_event_var.get()
         if event is not None and event.is_set():
             raise JsonRpcException(-32800, "Request cancelled")
 
     def get_current_transport_session_id(self) -> str | None:
-        return getattr(self._transport_session_id, "data", None)
+        return self.context.transport_session_id
 
     def register_http_session(self, session_id: str) -> None:
         with self._http_sessions_lock:
@@ -601,6 +842,33 @@ class McpServer:
         """Allow CORS requests from localhost on ANY port."""
         return urlparse(origin).hostname in ("localhost", "127.0.0.1", "::1")
 
+    def _request_id_from_body(self, body: dict | bytes | bytearray) -> int | str | None:
+        try:
+            request = body if isinstance(body, dict) else json.loads(body)
+        except Exception:
+            return None
+        if not isinstance(request, dict) or "id" not in request:
+            return None
+        request_id = request.get("id")
+        return request_id if type(request_id) in (int, str) else None
+
+    def _dispatch_mcp(self, request: dict | str | bytes | bytearray):
+        return self.registry.dispatch(request)
+
+    async def _dispatch_mcp_async(self, request: dict | str | bytes | bytearray):
+        return await self.registry.dispatch_async(request)
+
+    def _match_resource(self, uri: str) -> tuple[str, list[str]] | None:
+        # Try to match URI against all registered resource patterns.
+        for pattern, name, _ in self._enumerate_resources():
+            # Convert pattern to regex, replacing {param} with named capture groups.
+            regex_pattern = re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", pattern)
+            regex_pattern = f"^{regex_pattern}$"
+            match = re.match(regex_pattern, uri)
+            if match:
+                return name, list(match.groupdict().values())
+        return None
+
     def _mcp_ping(self, _meta: dict | None = None) -> dict:
         """MCP ping method"""
         return {}
@@ -608,7 +876,7 @@ class McpServer:
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
         return {
-            "protocolVersion": getattr(self._protocol_version, "data", protocolVersion),
+            "protocolVersion": self.context.protocol_version or protocolVersion,
             "capabilities": {
                 "tools": {},
                 "resources": {
@@ -632,53 +900,105 @@ class McpServer:
             ],
         }
 
-    def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None) -> dict:
+    def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None):
         """MCP tools/call method"""
+        # Wrap tool call in JSON-RPC request so argument validation stays shared.
+        return self._dispatch_nested_mcp(
+            self.tools,
+            {
+                "jsonrpc": "2.0",
+                "method": name,
+                "params": arguments,
+                "id": 0,
+            },
+            lambda tool_response: self._format_tool_response(name, tool_response),
+            meta=_meta,
+            cancellable=True,
+        )
+
+    def _dispatch_nested_mcp(
+        self,
+        registry: JsonRpcRegistry,
+        request: dict[str, Any],
+        formatter: Callable[[Mapping[str, Any]], dict],
+        *,
+        meta: dict | None,
+        cancellable: bool = False,
+    ):
+        if self.registry._in_async_dispatch():
+            return self._dispatch_nested_mcp_async(registry, request, formatter, meta=meta, cancellable=cancellable)
+
+        with self._nested_mcp_scope(meta=meta, cancellable=cancellable):
+            response = registry.dispatch(request)
+        assert response is not None, "Only notification requests return None"
+        return formatter(response)
+
+    async def _dispatch_nested_mcp_async(
+        self,
+        registry: JsonRpcRegistry,
+        request: dict[str, Any],
+        formatter: Callable[[Mapping[str, Any]], dict],
+        *,
+        meta: dict | None,
+        cancellable: bool = False,
+    ):
+        with self._nested_mcp_scope(meta=meta, cancellable=cancellable):
+            response = await registry.dispatch_async(request)
+        assert response is not None, "Only notification requests return None"
+        return formatter(response)
+
+    @contextmanager
+    def _nested_mcp_scope(self, *, meta: dict | None, cancellable: bool = False):
+        if cancellable:
+            request_id, cancel_event = self._register_cancel_event()
+        else:
+            request_id = self.registry.current_request_id()
+            cancel_event = None
+
+        cancel_scope = self._cancel_scope(cancel_event) if cancellable else nullcontext()
+        try:
+            with self._context_scope(request_id=request_id, meta=meta), cancel_scope:
+                yield
+        finally:
+            if cancellable:
+                self._unregister_cancel_event(request_id)
+
+    def _register_cancel_event(self) -> tuple[int | str | None, threading.Event | None]:
         request_id = self.registry.current_request_id()
-        previous_cancel_event = getattr(self._request_context, "cancel_event", None)
         cancel_event: threading.Event | None = None
         if request_id is not None:
             cancel_event = threading.Event()
             key = (self.get_current_transport_session_id(), request_id)
             with self._pending_requests_lock:
                 self._pending_requests[key] = cancel_event
-            setattr(self._request_context, "cancel_event", cancel_event)
+        return request_id, cancel_event
 
-        try:
-            # Wrap tool call in JSON-RPC request
-            tool_response = self.tools.dispatch({
-                "jsonrpc": "2.0",
-                "method": name,
-                "params": arguments,
-                "id": 0,
-            })
-            assert tool_response is not None, "Only notification requests return None"
+    def _unregister_cancel_event(self, request_id: int | str | None) -> None:
+        if request_id is not None:
+            with self._pending_requests_lock:
+                self._pending_requests.pop((self.get_current_transport_session_id(), request_id), None)
 
-            # Unknown tools, invalid arguments, and cancellation are protocol errors.
-            if "error" in tool_response:
-                error = tool_response["error"]
-                if error["code"] in (-32601, -32602, -32800):
-                    raise JsonRpcException(error["code"], error["message"], error.get("data"))
-                return {
-                    "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
-                    "isError": True,
-                }
-
-            result = tool_response.get("result")
-            content = result if isinstance(result, str) else json.dumps(result, indent=2)
-            mcp_result = {
-                "content": [{"type": "text", "text": content}],
-                "isError": False,
+    def _format_tool_response(self, name: str, tool_response: Mapping[str, Any]) -> dict:
+        # Unknown tools, invalid arguments, and cancellation are protocol errors.
+        if "error" in tool_response:
+            error = tool_response["error"]
+            if error["code"] in (-32601, -32602, -32800):
+                raise JsonRpcException(error["code"], error["message"], error.get("data"))
+            return {
+                "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
+                "isError": True,
             }
-            structured_content = self._structured_content_for_tool(name, result)
-            if structured_content is not None:
-                mcp_result["structuredContent"] = structured_content
-            return mcp_result
-        finally:
-            if request_id is not None:
-                with self._pending_requests_lock:
-                    self._pending_requests.pop((self.get_current_transport_session_id(), request_id), None)
-            setattr(self._request_context, "cancel_event", previous_cancel_event)
+
+        result = tool_response.get("result")
+        content = result if isinstance(result, str) else json.dumps(result, indent=2)
+        mcp_result = {
+            "content": [{"type": "text", "text": content}],
+            "isError": False,
+        }
+        structured_content = self._structured_content_for_tool(name, result)
+        if structured_content is not None:
+            mcp_result["structuredContent"] = structured_content
+        return mcp_result
 
     def _mcp_notifications_initialized(self, _meta: dict | None = None) -> None:
         """MCP notifications/initialized method"""
@@ -738,41 +1058,39 @@ class McpServer:
             ]
         }
 
-    def _mcp_resources_read(self, uri: str, _meta: dict | None = None) -> dict:
+    def _mcp_resources_read(self, uri: str, _meta: dict | None = None):
         """MCP resources/read method"""
+        match = self._match_resource(uri)
+        if match is None:
+            raise JsonRpcException(-32002, "Resource not found", {"uri": uri})
 
-        # Try to match URI against all registered resource patterns
-        for pattern, name, _ in self._enumerate_resources():
-            # Convert pattern to regex, replacing {param} with named capture groups
-            regex_pattern = re.sub(r"\{(\w+)\}", r"(?P<\1>[^/]+)", pattern)
-            regex_pattern = f"^{regex_pattern}$"
+        name, params = match
+        # Call the matched resource via JSON-RPC so argument validation stays shared.
+        return self._dispatch_nested_mcp(
+            self.resources,
+            {
+                "jsonrpc": "2.0",
+                "method": name,
+                "params": params,
+                "id": 0,
+            },
+            lambda resource_response: self._format_resource_response(uri, resource_response),
+            meta=_meta,
+        )
 
-            match = re.match(regex_pattern, uri)
-            if match:
-                # Found matching resource - call it via JSON-RPC
-                params = list(match.groupdict().values())
+    def _format_resource_response(self, uri: str, resource_response: Mapping[str, Any]) -> dict:
+        # Check for error response.
+        if "error" in resource_response:
+            error = resource_response["error"]
+            raise JsonRpcException(error["code"], error["message"], error.get("data"))
 
-                resource_response = self.resources.dispatch({
-                    "jsonrpc": "2.0",
-                    "method": name,
-                    "params": params,
-                    "id": 0,
-                })
-                assert resource_response is not None, "Only notification requests return None"
-
-                if "error" in resource_response:
-                    error = resource_response["error"]
-                    raise JsonRpcException(error["code"], error["message"], error.get("data"))
-
-                return {
-                    "contents": [{
-                        "uri": uri,
-                        "mimeType": "application/json",
-                        "text": json.dumps(resource_response.get("result"), indent=2),
-                    }]
-                }
-
-        raise JsonRpcException(-32002, "Resource not found", {"uri": uri})
+        return {
+            "contents": [{
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json.dumps(resource_response.get("result"), indent=2),
+            }]
+        }
 
     def _mcp_prompts_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
         """MCP prompts/list method"""
@@ -785,31 +1103,33 @@ class McpServer:
 
     def _mcp_prompts_get(
         self, name: str, arguments: dict | None = None, _meta: dict | None = None
-    ) -> dict:
+    ):
         """MCP prompts/get method"""
-        # Dispatch to prompts registry
-        prompt_response = self.prompts.dispatch(
+        return self._dispatch_nested_mcp(
+            self.prompts,
             {
                 "jsonrpc": "2.0",
                 "method": name,
                 "params": arguments,
                 "id": 0,
-            }
+            },
+            self._format_prompt_response,
+            meta=_meta,
         )
-        assert prompt_response is not None, "Only notification requests return None"
 
-        # Check for error response
+    def _format_prompt_response(self, prompt_response: Mapping[str, Any]) -> dict:
+        # Check for error response.
         if "error" in prompt_response:
             error = prompt_response["error"]
             raise JsonRpcException(error["code"], error["message"], error.get("data"))
 
         result = prompt_response.get("result")
 
-        # Pass through list of messages directly
+        # Pass through list of messages directly.
         if isinstance(result, list):
             return {"messages": result}
 
-        # Convert non-string results to JSON
+        # Convert non-string results to JSON.
         if not isinstance(result, str):
             result = json.dumps(result, indent=2)
         return {
@@ -971,6 +1291,10 @@ class McpServer:
                 "required": required,
             },
         }
+
+        annotations = getattr(func, "__mcp_tool_annotations__", None)
+        if annotations and self.context.protocol_version != LEGACY_SSE_PROTOCOL_VERSION:
+            schema["annotations"] = annotations
 
         # Add outputSchema if return type exists and is not None/Any/text-only
         if return_type and return_type is not type(None) and return_type is not Any and not self._type_is_plain_str(return_type):

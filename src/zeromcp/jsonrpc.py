@@ -1,6 +1,7 @@
-import json
+import asyncio
+import contextvars
 import inspect
-import threading
+import json
 import traceback
 from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
@@ -35,17 +36,96 @@ class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
         self._cache: dict[Callable, tuple[inspect.Signature, dict, list[str]]] = {}
-        self._current_request = threading.local()
+        self._current_request: contextvars.ContextVar[JsonRpcId] = contextvars.ContextVar("zeromcp_current_request_id", default=None)
+        self._async_dispatch: contextvars.ContextVar[bool] = contextvars.ContextVar("zeromcp_async_dispatch", default=False)
         self.redact_exceptions = False
 
     def current_request_id(self) -> JsonRpcId:
-        return getattr(self._current_request, "id", None)
+        return self._current_request.get()
+
+    def _in_async_dispatch(self) -> bool:
+        return self._async_dispatch.get()
 
     def method(self, func: Callable, name: str | None = None) -> Callable:
-        self.methods[name or func.__name__] = func # type: ignore
+        self.methods[name or getattr(func, "__name__", func.__class__.__name__)] = func
         return func
 
     def dispatch(self, request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
+        parsed = self._prepare_request(request)
+        if isinstance(parsed, dict):
+            return parsed
+        method, params, request_id, is_notification = parsed
+
+        request_token = self._current_request.set(request_id)
+        async_token = self._async_dispatch.set(False)
+        try:
+            result = self._call(method, params)
+            if inspect.isawaitable(result):
+                result = self._run_awaitable(method, result)
+            if is_notification:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "result": result,
+                "id": request_id,
+            }
+        except JsonRpcException as e:
+            if is_notification:
+                return None
+            return self._error(request_id, e.code, e.message, e.data)
+        except Exception as e:
+            if is_notification:
+                return None
+            error = self.map_exception(e)
+            return self._error(request_id, error["code"], error["message"], error.get("data"))
+        finally:
+            self._async_dispatch.reset(async_token)
+            self._current_request.reset(request_token)
+
+    async def dispatch_async(self, request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
+        parsed = self._prepare_request(request)
+        if isinstance(parsed, dict):
+            return parsed
+        method, params, request_id, is_notification = parsed
+
+        request_token = self._current_request.set(request_id)
+        async_token = self._async_dispatch.set(True)
+        try:
+            result = self._call(method, params)
+            if inspect.isawaitable(result):
+                result = await result
+            if is_notification:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "result": result,
+                "id": request_id,
+            }
+        except JsonRpcException as e:
+            if is_notification:
+                return None
+            return self._error(request_id, e.code, e.message, e.data)
+        except Exception as e:
+            if is_notification:
+                return None
+            error = self.map_exception(e)
+            return self._error(request_id, error["code"], error["message"], error.get("data"))
+        finally:
+            self._async_dispatch.reset(async_token)
+            self._current_request.reset(request_token)
+
+    def _run_awaitable(self, method: str, awaitable: Any) -> Any:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(awaitable)
+
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        raise JsonRpcException(-32603, f"Method '{method}' is async; use dispatch_async")
+
+    def _prepare_request(self, request: dict | str | bytes | bytearray) -> tuple[str, JsonRpcParams, JsonRpcId, bool] | JsonRpcResponse:
         try:
             if not isinstance(request, dict):
                 request = json.loads(request)
@@ -69,28 +149,7 @@ class JsonRpcRegistry:
             return self._error(None, -32600, "Invalid request: 'id' must be a string, integer, or null")
 
         params: JsonRpcParams = request.get("params")
-        previous_id = self.current_request_id()
-        self._current_request.id = request_id
-        try:
-            result = self._call(method, params)
-            if is_notification:
-                return None
-            return {
-                "jsonrpc": "2.0",
-                "result": result,
-                "id": request_id,
-            }
-        except JsonRpcException as e:
-            if is_notification:
-                return None
-            return self._error(request_id, e.code, e.message, e.data)
-        except Exception as e:
-            if is_notification:
-                return None
-            error = self.map_exception(e)
-            return self._error(request_id, error["code"], error["message"], error.get("data"))
-        finally:
-            self._current_request.id = previous_id
+        return method, params, request_id, is_notification
 
     def map_exception(self, e: Exception) -> JsonRpcError:
         if self.redact_exceptions:
@@ -254,7 +313,7 @@ class JsonRpcRegistry:
         else:
             raise JsonRpcException(-32602, "Invalid params: must be array or object")
 
-    def _error(self, request_id: JsonRpcId, code: int, message: str, data: Any = None) -> JsonRpcResponse | None:
+    def _error(self, request_id: JsonRpcId, code: int, message: str, data: Any = None) -> JsonRpcResponse:
         error: JsonRpcError = {
             "code": code,
             "message": message,

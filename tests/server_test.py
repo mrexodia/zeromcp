@@ -7,7 +7,8 @@ import socket
 import zlib
 from contextlib import contextmanager
 from types import SimpleNamespace
-from zeromcp import McpServer, McpHttpRequestHandler
+from typing import BinaryIO, cast
+from zeromcp import McpAuthInfo, McpServer, McpHttpRequestHandler
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -58,6 +59,7 @@ def test_streamable_http_session_id():
             json={"jsonrpc": "2.0", "method": "initialize", "id": 1},
         )
         assert "error" in resp.json(), "malformed initialize should fail"
+        assert "Mcp-Session-Id" not in resp.headers, "failed initialize should not return a session ID"
         assert not server.has_http_session(bad_session_id), "failed initialize should not register session ID"
         resp = requests.post(f"{base_url}/mcp", headers={"Mcp-Session-Id": bad_session_id}, json=PING_JSON)
         assert resp.status_code == 404, "failed initialize session ID should not be accepted"
@@ -136,7 +138,7 @@ def test_str_tool_result_is_unstructured_text():
     def text_tool() -> str:
         return "hello \"world\"\nline2"
 
-    list_response = server.registry.dispatch({
+    list_response = server._dispatch_mcp({
         "jsonrpc": "2.0",
         "method": "tools/list",
         "id": 1,
@@ -145,7 +147,7 @@ def test_str_tool_result_is_unstructured_text():
     tool_schema = list_response["result"]["tools"][0]
     assert "outputSchema" not in tool_schema, "str return tools should not advertise structured output"
 
-    call_response = server.registry.dispatch({
+    call_response = server._dispatch_mcp({
         "jsonrpc": "2.0",
         "method": "tools/call",
         "params": {"name": "text_tool", "arguments": {}},
@@ -155,6 +157,176 @@ def test_str_tool_result_is_unstructured_text():
     result = call_response["result"]
     assert result["content"] == [{"type": "text", "text": "hello \"world\"\nline2"}]
     assert "structuredContent" not in result, "str return tools should not include structuredContent"
+    print("✓ PASS")
+
+
+def test_sync_tool_can_bridge_to_async_in_sync_transport():
+    print("Testing sync tool stays outside the transport event loop...")
+    import asyncio
+
+    server = McpServer("sync-bridge-test")
+
+    @server.tool
+    def sync_bridge() -> str:
+        return asyncio.run(asyncio.sleep(0, result="ok"))
+
+    response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "sync_bridge", "arguments": {}},
+        "id": 1,
+    })
+    assert response is not None
+    result = response["result"]
+    assert not result["isError"]
+    assert result["content"][0]["text"] == "ok"
+    print("✓ PASS")
+
+
+def test_request_context_meta_and_async_tool():
+    print("Testing request context metadata and async tools...")
+    import asyncio
+
+    server = McpServer("context-test")
+
+    @server.tool
+    async def inspect_context() -> dict:
+        await asyncio.sleep(0)
+        return {
+            "request_id": server.context.request_id,
+            "meta": server.context.meta,
+        }
+
+    response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "inspect_context",
+            "arguments": {},
+            "_meta": {"progressToken": "progress-1", "example/key": "value"},
+        },
+        "id": "ctx-id",
+    })
+    assert response is not None
+    result = response["result"]
+    assert not result["isError"]
+    assert result["structuredContent"]["request_id"] == "ctx-id"
+    assert result["structuredContent"]["meta"] == {"progressToken": "progress-1", "example/key": "value"}
+
+    async def call_async_transport():
+        return await server._dispatch_mcp_async({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "inspect_context",
+                "arguments": {},
+                "_meta": {"progressToken": "progress-2"},
+            },
+            "id": "ctx-async-id",
+        })
+
+    response = asyncio.run(call_async_transport())
+    assert response is not None
+    result = response["result"]
+    assert result["structuredContent"]["request_id"] == "ctx-async-id"
+    assert result["structuredContent"]["meta"] == {"progressToken": "progress-2"}
+    print("✓ PASS")
+
+
+def test_tool_annotations():
+    print("Testing tool annotations...")
+    server = McpServer("annotations-test")
+
+    @server.tool(read_only=True, destructive=False, idempotent=True, open_world=False)
+    def safe_tool() -> str:
+        return "safe"
+
+    response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert response is not None
+    tool_schema = response["result"]["tools"][0]
+    assert tool_schema["annotations"] == {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    }
+    print("✓ PASS")
+
+
+def test_oauth_resource_server():
+    print("Testing OAuth resource server support...")
+    port = find_free_port()
+    server = McpServer("oauth-test")
+
+    @server.oauth(
+        resource="http://resource.example/mcp",
+        authorization_servers=["https://auth.example"],
+        scopes_supported=["mcp"],
+        required_scopes=["mcp"],
+    )
+    def verify_token(token: str, resource: str) -> McpAuthInfo | None:
+        assert resource == "http://resource.example/mcp"
+        if token == "good-token":
+            return McpAuthInfo(subject="alice", scopes=frozenset({"mcp"}), claims={"sub": "alice"})
+        if token == "no-scope-token":
+            return McpAuthInfo(subject="bob", scopes=frozenset(), claims={"sub": "bob"})
+        return None
+
+    @server.tool
+    def whoami() -> str:
+        assert server.context.auth is not None
+        return f"{server.context.auth.subject}:{server.context.auth.claims['sub']}"
+
+    server.serve("127.0.0.1", port, background=True)
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        metadata = requests.get(f"{base_url}/.well-known/oauth-protected-resource")
+        assert metadata.status_code == 200
+        assert metadata.json() == {
+            "resource": "http://resource.example/mcp",
+            "authorization_servers": ["https://auth.example"],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["mcp"],
+        }
+
+        resp = requests.post(f"{base_url}/mcp", json=PING_JSON)
+        assert resp.status_code == 401
+        assert "WWW-Authenticate" in resp.headers
+        assert "resource_metadata" in resp.headers["WWW-Authenticate"]
+
+        resp = requests.post(f"{base_url}/mcp", headers={"Authorization": "Bearer bad-token"}, json=PING_JSON)
+        assert resp.status_code == 401
+
+        resp = requests.post(f"{base_url}/mcp", headers={"Authorization": "Bearer no-scope-token"}, json=PING_JSON)
+        assert resp.status_code == 403
+
+        resp = requests.options(
+            f"{base_url}/mcp",
+            headers={
+                "Origin": "http://localhost:1234",
+                "Access-Control-Request-Headers": "Authorization",
+            },
+        )
+        assert "Authorization" in resp.headers.get("Access-Control-Allow-Headers", "")
+
+        resp = requests.post(
+            f"{base_url}/mcp",
+            headers={"Authorization": "Bearer good-token"},
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "whoami", "arguments": {}},
+                "id": 1,
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["result"]["content"][0]["text"] == "alice:alice"
+    finally:
+        server.stop()
     print("✓ PASS")
 
 
@@ -170,6 +342,54 @@ def test_list_cursor_params_are_accepted():
             })
             assert resp.status_code == 200
             assert "result" in resp.json(), f"{method} should accept cursor"
+    print("✓ PASS")
+
+
+def test_stdio_async_cancellation():
+    print("Testing async stdio cancellation...")
+    import asyncio
+    import threading
+
+    server = McpServer("stdio-cancel-test")
+    started = threading.Event()
+
+    @server.tool
+    async def slow_tool():
+        started.set()
+        while True:
+            server.check_cancelled()
+            await asyncio.sleep(0.01)
+
+    call = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "slow_tool", "arguments": {}},
+        "id": 1,
+    }).encode("utf-8") + b"\n"
+    cancel = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": 1},
+    }).encode("utf-8") + b"\n"
+
+    class Stdin:
+        def __init__(self):
+            self.index = 0
+
+        def readline(self):
+            self.index += 1
+            if self.index == 1:
+                return call
+            if self.index == 2:
+                assert started.wait(2), "tool should start before cancellation is sent"
+                return cancel
+            return b""
+
+    stdout = io.BytesIO()
+    asyncio.run(server.stdio_async(cast(BinaryIO, Stdin()), stdout))
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+    assert len(responses) == 1
+    assert responses[0]["error"]["code"] == -32800
     print("✓ PASS")
 
 
@@ -190,7 +410,7 @@ def test_cancelled_helper():
             time.sleep(0.01)
 
     def call_tool():
-        result["response"] = server.registry.dispatch({
+        result["response"] = server._dispatch_mcp({
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {"name": "slow_tool", "arguments": {}},
@@ -201,7 +421,7 @@ def test_cancelled_helper():
     thread.start()
     assert started.wait(2), "tool should have started"
 
-    server.registry.dispatch({
+    server._dispatch_mcp({
         "jsonrpc": "2.0",
         "method": "notifications/cancelled",
         "params": {"requestId": 1},
@@ -501,7 +721,12 @@ def run_all_tests():
         test_protocol_version_header_validation()
         test_tool_protocol_errors()
         test_str_tool_result_is_unstructured_text()
+        test_sync_tool_can_bridge_to_async_in_sync_transport()
+        test_request_context_meta_and_async_tool()
+        test_tool_annotations()
+        test_oauth_resource_server()
         test_list_cursor_params_are_accepted()
+        test_stdio_async_cancellation()
         test_cancelled_helper()
         test_cors_permissive()
         test_cors_restrictive()

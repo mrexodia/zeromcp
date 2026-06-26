@@ -4,6 +4,7 @@ import socket
 import asyncio
 import subprocess
 
+import requests
 from pydantic import AnyUrl
 from mcp import ClientSession, StdioServerParameters, McpError, types
 from mcp.client.stdio import stdio_client
@@ -293,8 +294,79 @@ async def test_serve():
         process.wait()
     pass
 
+async def test_serve_oauth():
+    print("[serve-oauth] Testing...")
+
+    address = f"http://127.0.0.1:{find_available_port()}"
+    token = "oauth-test-token"
+    process = subprocess.Popen(
+        [sys.executable]
+        + coverage_wrap(
+            "serve-oauth",
+            [
+                example_mcp,
+                "--transport",
+                address,
+                "--oauth",
+                "--oauth-token",
+                token,
+                "--oauth-resource",
+                f"{address}/mcp",
+                "--oauth-authorization-server",
+                "https://auth.example.com",
+                "--oauth-scope",
+                "mcp",
+            ],
+        ),
+        stdin=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+    )
+    try:
+        await asyncio.sleep(0.5)
+        metadata = requests.get(f"{address}/.well-known/oauth-protected-resource")
+        assert metadata.status_code == 200
+        assert metadata.json() == {
+            "resource": f"{address}/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["mcp"],
+        }
+
+        ping = {"jsonrpc": "2.0", "method": "ping", "id": 1}
+        unauthorized = requests.post(f"{address}/mcp", json=ping)
+        assert unauthorized.status_code == 401
+        assert "resource_metadata" in unauthorized.headers.get("WWW-Authenticate", "")
+
+        authorized = requests.post(
+            f"{address}/mcp",
+            headers={"Authorization": f"Bearer {token}"},
+            json=ping,
+        )
+        assert authorized.status_code == 200
+        assert authorized.json() == {"jsonrpc": "2.0", "result": {}, "id": 1}
+
+        whoami = requests.post(
+            f"{address}/mcp",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "whoami", "arguments": {}},
+                "id": 2,
+            },
+        )
+        assert whoami.status_code == 200
+        assert whoami.json()["result"]["structuredContent"]["subject"] == "example-user"
+    finally:
+        print("[serve-oauth] Terminating example MCP server")
+        process.stdin.close()  # type: ignore
+        process.wait()
+
 async def main():
     await test_serve()
+    await test_serve_oauth()
     await test_stdio()
 
 if __name__ == "__main__":

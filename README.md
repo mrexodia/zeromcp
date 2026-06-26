@@ -12,7 +12,7 @@ A lightweight, handcrafted implementation of the [Model Context Protocol](https:
 - 🛠️ **Handcrafted** - Written by a human<sup>[1](#ai-usage)</sup>, verified against the spec
 - 🌐 **HTTP/SSE transport** - Streamable responses
 - 📡 **Stdio transport** - For legacy clients
-- 📦 **Tiny** - Less than 1,000 lines of code
+- 📦 **Tiny** - Compact codebase with no framework dependency
 
 ## Installation
 
@@ -206,6 +206,77 @@ def code_review(
 ) -> str:
     """Review code for bugs and improvements"""
     return f"Please review this {language} code:\n\n```{language}\n{code}\n```"
+```
+
+## Tool annotations
+
+MCP 2025-03-26+ supports tool behavior hints:
+
+```python
+@mcp.tool(read_only=True, destructive=False, idempotent=True, open_world=False)
+def get_status() -> dict:
+    """Read current system status"""
+    return {"ok": True}
+```
+
+## Request context
+
+Tools, resources, and prompts can inspect the current MCP request context:
+
+```python
+@mcp.tool
+def inspect_request() -> dict:
+    return {
+        "request_id": mcp.context.request_id,
+        "meta": mcp.context.meta,
+        "auth_subject": mcp.context.auth.subject if mcp.context.auth else None,
+    }
+```
+
+`mcp.context.meta` contains the request `_meta` object, including fields such as `progressToken`.
+
+## Async tools
+
+Async tools, resources, prompts, and JSON-RPC methods are supported. HTTP and stdio transports stay synchronous by default; async stdio concurrency is opt-in with `await mcp.stdio_async()`.
+
+```python
+import asyncio
+
+@mcp.tool
+async def slow_lookup(key: str) -> str:
+    await asyncio.sleep(1)
+    return key
+```
+
+## OAuth resource server
+
+zeromcp can act as an MCP OAuth resource server. Token validation is provided by your application:
+
+```python
+from zeromcp import McpAuthInfo
+
+@mcp.oauth(
+    resource="https://mcp.example.com/mcp",
+    authorization_servers=["https://auth.example.com"],
+    scopes_supported=["mcp"],
+    required_scopes=["mcp"],
+)
+def verify_token(token: str, resource: str) -> McpAuthInfo | None:
+    if token == "expected":
+        return McpAuthInfo(
+            subject="user-123",
+            scopes=frozenset({"mcp"}),
+            claims={"sub": "user-123"},
+        )
+    return None
+```
+
+When OAuth is configured, HTTP MCP requests require `Authorization: Bearer <token>`. zeromcp exposes OAuth Protected Resource Metadata at `/.well-known/oauth-protected-resource`.
+
+The example server includes a static-token OAuth verifier for local testing:
+
+```bash
+uv run examples/mcp_example.py --transport http://127.0.0.1:5001 --oauth --oauth-token dev-token --oauth-resource http://127.0.0.1:5001/mcp
 ```
 
 ## CORS

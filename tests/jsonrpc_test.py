@@ -1,6 +1,7 @@
 """
 Comprehensive JSON-RPC 2.0 test suite for MCP implementation
 """
+import asyncio
 import json
 import sys
 import traceback
@@ -67,6 +68,11 @@ def python_repr(value: Any) -> str:
 @jsonrpc.method
 def unknown(x, y):
     return x + y
+
+@jsonrpc.method
+async def async_foobar() -> str:
+    await asyncio.sleep(0)
+    return f"async:{jsonrpc.current_request_id()}"
 
 def matches_response(actual: dict | None, expected: dict | None) -> bool:
     """Check if actual response matches expected, with regex support for error messages."""
@@ -158,6 +164,20 @@ def test_rpc(request: Any, expected_response: dict | None = None, description: s
     return result
 
 
+def test_async_method_dispatch():
+    print(f"\n{'='*60}")
+    print("Test: async method dispatch")
+
+    result = jsonrpc.dispatch({"jsonrpc": "2.0", "method": "async_foobar", "id": "async-api-id"})
+    expected = {"jsonrpc": "2.0", "result": "async:async-api-id", "id": "async-api-id"}
+    if result != expected:
+        print("❌ FAIL: dispatch returned wrong response")
+        print(f"Expected: {expected}")
+        print(f"Got: {result}")
+        sys.exit(1)
+    print("✓ PASS")
+
+
 def test_current_request_id_is_stack_safe():
     print(f"\n{'='*60}")
     print("Test: current_request_id is restored across nested dispatch")
@@ -171,9 +191,9 @@ def test_current_request_id_is_stack_safe():
         return "ok"
 
     @registry.method
-    def outer():
+    async def outer():
         seen.append(("outer_before", registry.current_request_id()))
-        response = registry.dispatch({"jsonrpc": "2.0", "method": "inner", "id": "inner-id"})
+        response = await registry.dispatch_async({"jsonrpc": "2.0", "method": "inner", "id": "inner-id"})
         seen.append(("outer_after", registry.current_request_id()))
         assert response is not None
         return response["result"]
@@ -325,6 +345,12 @@ def run_all_tests():
         '{"jsonrpc": "2.0", "method": "foobar", "id": true}',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'id' must be a string, integer, or null"}, "id": None},
         "Invalid request with boolean id"
+    )
+
+    test_rpc(
+        '{"jsonrpc": "2.0", "method": "async_foobar", "id": "async-id"}',
+        {"jsonrpc": "2.0", "result": "async:async-id", "id": "async-id"},
+        "Async method dispatch"
     )
 
     # ========================================
@@ -591,6 +617,7 @@ def run_all_tests():
         "Notification - method that raises python exception"
     )
 
+    test_async_method_dispatch()
     test_current_request_id_is_stack_safe()
 
     print("\n" + "="*60)
