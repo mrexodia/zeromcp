@@ -5,6 +5,7 @@ import uuid
 import json
 import gzip
 import zlib
+import ipaddress
 import inspect
 import threading
 import traceback
@@ -61,6 +62,56 @@ class _McpSseConnection:
             self.alive = False
             return False
 
+def _origin_allowed_by_policy(
+    allowed: Callable[[str], bool] | list[str] | str | None,
+    origin: str,
+) -> bool:
+    if not origin or allowed is None:
+        return False
+    if isinstance(allowed, str):
+        return allowed == "*" or origin == allowed
+    if isinstance(allowed, list):
+        return "*" in allowed or origin in allowed
+    return allowed(origin)
+
+def _parse_host_header(host_header: str | None) -> str | None:
+    if not host_header:
+        return None
+
+    host_header = host_header.strip()
+    if not host_header:
+        return None
+
+    if host_header.startswith("["):
+        end = host_header.find("]")
+        if end == -1:
+            return None
+        return host_header[1:end]
+
+    if host_header.count(":") == 1:
+        return host_header.rsplit(":", 1)[0]
+
+    return host_header
+
+def _is_loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+def _host_header_allowed_for_bind(bound_host: str, host_header: str | None) -> bool:
+    if host_header is None:
+        return True
+
+    host_name = _parse_host_header(host_header)
+    if host_name is None:
+        return False
+
+    if not _is_loopback_host(bound_host):
+        return True
+
+    return _is_loopback_host(host_name)
+
 class McpHttpRequestHandler(BaseHTTPRequestHandler):
     server_version = "zeromcp/1.3.0"
     error_message_format = "%(code)d - %(message)s"
@@ -76,23 +127,12 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def send_cors_headers(self, *, preflight = False):
         origin = self.headers.get("Origin", "")
-        if not origin:
-            return
-        def is_allowed():
-            allowed = self.mcp_server.cors_allowed_origins
-            if allowed is None:
-                return False
-            if isinstance(allowed, str):
-                return allowed == "*" or origin == allowed
-            if isinstance(allowed, list):
-                return "*" in allowed or origin in allowed
-            return allowed(origin)
-        if not is_allowed():
+        if not _origin_allowed_by_policy(self.mcp_server.cors_allowed_origins, origin):
             return
         self.send_header("Access-Control-Allow-Origin", origin)
         if preflight:
             self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, Mcp-Protocol-Version")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-Requested-With, Mcp-Session-Id, MCP-Protocol-Version")
             if self.headers.get("Access-Control-Request-Private-Network") == "true":
                 self.send_header("Access-Control-Allow-Private-Network", "true")
 
@@ -111,7 +151,22 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             # Client disconnected - normal, suppress traceback
             pass
 
+    def _check_api_request(self) -> bool:
+        server_address = getattr(self.server, "server_address", ("", 0))
+        bound_host = str(server_address[0]) if isinstance(server_address, tuple) else ""
+        if not _host_header_allowed_for_bind(bound_host, self.headers.get("Host")):
+            self.send_error(403, "Invalid Host")
+            return False
+
+        origin = self.headers.get("Origin", "")
+        if origin and not _origin_allowed_by_policy(self.mcp_server.cors_allowed_origins, origin):
+            self.send_error(403, "Invalid Origin")
+            return False
+        return True
+
     def do_GET(self):
+        if not self._check_api_request():
+            return
         match urlparse(self.path).path:
             case "/sse":
                 self._handle_sse_get()
@@ -121,6 +176,8 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(404, "Not Found")
 
     def do_POST(self):
+        if not self._check_api_request():
+            return
         body = self._read_body()
         if body is None:
             return
@@ -135,9 +192,16 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
+        if not self._check_api_request():
+            return
         self.send_response(200)
         self.send_cors_headers(preflight=True)
         self.end_headers()
+
+    def do_DELETE(self):
+        if not self._check_api_request():
+            return
+        self.send_error(405, "Method Not Allowed")
 
     def _read_body(self) -> bytes | None:
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
