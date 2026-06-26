@@ -221,9 +221,14 @@ def coverage_wrap(name: str, args: list[str]) -> list[str]:
 
 async def test_stdio():
     print("[stdio] Testing...")
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")),
+    }
     server_params = StdioServerParameters(
         command=sys.executable,
         args=coverage_wrap("stdio", [example_mcp, "--transport", "stdio"]),
+        env=env,
     )
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
