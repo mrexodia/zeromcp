@@ -3,7 +3,6 @@ import sys
 import time
 import uuid
 import json
-import gzip
 import zlib
 import ipaddress
 import inspect
@@ -221,6 +220,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
 
     def _read_chunked(self) -> bytes:
         body = b""
+        limit = self.mcp_server.post_body_limit
         while True:
             line = self.rfile.readline().split(b";")[0].strip()
             chunk_size = int(line, 16)
@@ -229,19 +229,36 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
                 while self.rfile.readline().strip():
                     pass
                 break
-            body += self.rfile.read(chunk_size)
+            body += self.rfile.read(min(chunk_size, limit + 1 - len(body)))
+            if len(body) > limit:
+                return body
             self.rfile.readline()
         return body
 
-    def _decompress_body(self, data: bytes) -> bytes:
+    def _decompress_limited(self, decompressor: Any, data: bytes) -> bytes | None:
+        limit = self.mcp_server.post_body_limit
+        output = decompressor.decompress(data, limit + 1)
+        if len(output) > limit:
+            self.send_error(413, f"Payload Too Large: exceeds {limit} bytes")
+            return None
+
+        output += decompressor.flush(limit + 1 - len(output))
+        if len(output) > limit:
+            self.send_error(413, f"Payload Too Large: exceeds {limit} bytes")
+            return None
+        return output
+
+    def _decompress_body(self, data: bytes) -> bytes | None:
         encoding = self.headers.get("Content-Encoding", "").lower().strip()
-        if encoding in ("gzip", "x-gzip"):
-            return gzip.decompress(data)
-        elif encoding == "deflate":
-            if data[:1] == b'\x78':
-                return zlib.decompress(data)
-            else:
-                return zlib.decompress(data, -15)
+        try:
+            if encoding in ("gzip", "x-gzip"):
+                return self._decompress_limited(zlib.decompressobj(16 + zlib.MAX_WBITS), data)
+            elif encoding == "deflate":
+                wbits = zlib.MAX_WBITS if data[:1] == b'\x78' else -zlib.MAX_WBITS
+                return self._decompress_limited(zlib.decompressobj(wbits), data)
+        except zlib.error:
+            self.send_error(400, "Invalid compressed request body")
+            return None
         return data
 
     def _handle_sse_get(self):
