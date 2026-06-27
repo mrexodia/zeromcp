@@ -18,10 +18,11 @@ from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
-from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException
+from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
-STREAMABLE_HTTP_PROTOCOL_VERSIONS = {"2025-03-26", MCP_PROTOCOL_VERSION, "2025-11-25"}
+DEFAULT_STREAMABLE_HTTP_PROTOCOL_VERSION = "2025-03-26"
+STREAMABLE_HTTP_PROTOCOL_VERSIONS = {DEFAULT_STREAMABLE_HTTP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, "2025-11-25"}
 LEGACY_SSE_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = STREAMABLE_HTTP_PROTOCOL_VERSIONS | {LEGACY_SSE_PROTOCOL_VERSION}
 
@@ -503,10 +504,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
                 requested_protocol_version = params["protocolVersion"]
 
-        request_session_id = self.headers.get("Mcp-Session-Id")
-        response_session_id = request_session_id
+        incoming_session_id = self.headers.get("Mcp-Session-Id")
+        request_session_id = incoming_session_id
+        response_session_id = incoming_session_id
         if request_method == "initialize":
-            request_session_id = request_session_id or str(uuid.uuid4())
+            request_session_id = str(uuid.uuid4())
             response_session_id = None
         elif self.mcp_server.require_streamable_http_session:
             if request_session_id is None:
@@ -532,17 +534,23 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             send_response(202, b"")
             return
 
-        active_protocol_version = protocol_version or MCP_PROTOCOL_VERSION
-        if request_method == "initialize" and protocol_version is None:
+        if request_method == "initialize":
             active_protocol_version = requested_protocol_version if requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+        else:
+            active_protocol_version = protocol_version
+            if active_protocol_version is None and incoming_session_id is not None:
+                active_protocol_version = self.mcp_server.get_http_session_protocol(incoming_session_id)
+            if active_protocol_version is None:
+                active_protocol_version = DEFAULT_STREAMABLE_HTTP_PROTOCOL_VERSION
 
         # Dispatch to MCP registry.
         request_id = self.mcp_server._request_id_from_body(parsed) if isinstance(parsed, dict) else None
+        transport_session_id = f"http:{request_session_id}" if request_session_id else f"http:anonymous:{uuid.uuid4()}"
         with self.mcp_server._context_scope(
             request_id=request_id,
             auth=auth_info,
             protocol_version=active_protocol_version,
-            transport_session_id=f"http:{request_session_id}" if request_session_id else "http:anonymous",
+            transport_session_id=transport_session_id,
         ):
             response = self.mcp_server._dispatch_mcp(body)
 
@@ -550,7 +558,9 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             assert request_session_id is not None
             response_session_id = request_session_id
             if self.mcp_server.require_streamable_http_session:
-                self.mcp_server.register_http_session(request_session_id)
+                self.mcp_server.register_http_session(request_session_id, active_protocol_version)
+            else:
+                self.mcp_server.remember_http_session_protocol(request_session_id, active_protocol_version)
 
         # Check if notification (returns None)
         if response is None:
@@ -573,7 +583,9 @@ class McpServer:
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
         self._http_sessions: set[str] = set()
+        self._http_session_protocol_versions: dict[str, str] = {}
         self._http_sessions_lock = threading.Lock()
+        self._stdio_protocol_version: str | None = None
         self._pending_requests: dict[tuple[str | None, int | str], threading.Event] = {}
         self._pending_requests_lock = threading.Lock()
         self._context_var: contextvars.ContextVar[McpRequestContext] = contextvars.ContextVar(
@@ -771,8 +783,15 @@ class McpServer:
                     continue
 
                 request_id = self._request_id_from_body(request)
-                with self._context_scope(request_id=request_id, transport_session_id="stdio:default"):
+                request_method, active_protocol_version = self._stdio_request_protocol(request)
+                with self._context_scope(
+                    request_id=request_id,
+                    protocol_version=active_protocol_version,
+                    transport_session_id="stdio:default",
+                ):
                     response = self._dispatch_mcp(request)
+                if request_method == "initialize" and response is not None and "error" not in response:
+                    self._stdio_protocol_version = active_protocol_version
                 if response is not None:
                     stdout.write(json.dumps(response).encode("utf-8") + b"\n")
                     stdout.flush()
@@ -794,8 +813,15 @@ class McpServer:
 
         async def handle_request(request: bytes):
             request_id = self._request_id_from_body(request)
-            with self._context_scope(request_id=request_id, transport_session_id="stdio:default"):
-                response = await self._dispatch_mcp_async(request)
+            request_method, active_protocol_version = self._stdio_request_protocol(request)
+            with self._context_scope(
+                request_id=request_id,
+                protocol_version=active_protocol_version,
+                transport_session_id="stdio:default",
+            ):
+                response = await asyncio.to_thread(self._dispatch_mcp, request)
+            if request_method == "initialize" and response is not None and "error" not in response:
+                self._stdio_protocol_version = active_protocol_version
             await write_response(response)
 
         while True:
@@ -821,14 +847,43 @@ class McpServer:
     def check_cancelled(self) -> None:
         event = self._cancel_event_var.get()
         if event is not None and event.is_set():
-            raise JsonRpcException(-32800, "Request cancelled")
+            raise JsonRpcNoResponse()
+
+    def _stdio_request_protocol(self, body: dict | bytes | bytearray) -> tuple[str | None, str]:
+        try:
+            request = body if isinstance(body, dict) else json.loads(body)
+        except Exception:
+            return None, self._stdio_protocol_version or MCP_PROTOCOL_VERSION
+        if not isinstance(request, dict):
+            return None, self._stdio_protocol_version or MCP_PROTOCOL_VERSION
+
+        method = request.get("method")
+        if method != "initialize":
+            return method if isinstance(method, str) else None, self._stdio_protocol_version or MCP_PROTOCOL_VERSION
+
+        requested_protocol_version = None
+        params = request.get("params")
+        if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
+            requested_protocol_version = params["protocolVersion"]
+        active_protocol_version = requested_protocol_version if requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+        return method, active_protocol_version
 
     def get_current_transport_session_id(self) -> str | None:
         return self.context.transport_session_id
 
-    def register_http_session(self, session_id: str) -> None:
+    def remember_http_session_protocol(self, session_id: str, protocol_version: str) -> None:
+        with self._http_sessions_lock:
+            self._http_session_protocol_versions[session_id] = protocol_version
+
+    def get_http_session_protocol(self, session_id: str) -> str | None:
+        with self._http_sessions_lock:
+            return self._http_session_protocol_versions.get(session_id)
+
+    def register_http_session(self, session_id: str, protocol_version: str | None = None) -> None:
         with self._http_sessions_lock:
             self._http_sessions.add(session_id)
+            if protocol_version is not None:
+                self._http_session_protocol_versions[session_id] = protocol_version
 
     def has_http_session(self, session_id: str) -> bool:
         with self._http_sessions_lock:
@@ -837,6 +892,7 @@ class McpServer:
     def unregister_http_session(self, session_id: str) -> None:
         with self._http_sessions_lock:
             self._http_sessions.discard(session_id)
+            self._http_session_protocol_versions.pop(session_id, None)
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""
@@ -930,7 +986,8 @@ class McpServer:
 
         with self._nested_mcp_scope(meta=meta, cancellable=cancellable):
             response = registry.dispatch(request)
-        assert response is not None, "Only notification requests return None"
+        if response is None:
+            raise JsonRpcNoResponse()
         return formatter(response)
 
     async def _dispatch_nested_mcp_async(
@@ -944,7 +1001,8 @@ class McpServer:
     ):
         with self._nested_mcp_scope(meta=meta, cancellable=cancellable):
             response = await registry.dispatch_async(request)
-        assert response is not None, "Only notification requests return None"
+        if response is None:
+            raise JsonRpcNoResponse()
         return formatter(response)
 
     @contextmanager
@@ -978,12 +1036,23 @@ class McpServer:
             with self._pending_requests_lock:
                 self._pending_requests.pop((self.get_current_transport_session_id(), request_id), None)
 
+    def _current_protocol_version(self) -> str:
+        return self.context.protocol_version or MCP_PROTOCOL_VERSION
+
+    def _protocol_at_least(self, version: str) -> bool:
+        return self._current_protocol_version() >= version
+
+    def _tool_validation_errors_are_execution_errors(self) -> bool:
+        return self._protocol_at_least("2025-11-25")
+
     def _format_tool_response(self, name: str, tool_response: Mapping[str, Any]) -> dict:
-        # Unknown tools, invalid arguments, and cancellation are protocol errors.
         if "error" in tool_response:
             error = tool_response["error"]
-            if error["code"] in (-32601, -32602, -32800):
-                raise JsonRpcException(error["code"], error["message"], error.get("data"))
+            code = error["code"]
+            if code == -32800:
+                raise JsonRpcNoResponse()
+            if code == -32601 or (code == -32602 and not self._tool_validation_errors_are_execution_errors()):
+                raise JsonRpcException(code, error["message"], error.get("data"))
             return {
                 "content": [{"type": "text", "text": error["message"] or "Unknown error"}],
                 "isError": True,
@@ -1076,6 +1145,7 @@ class McpServer:
             },
             lambda resource_response: self._format_resource_response(uri, resource_response),
             meta=_meta,
+            cancellable=True,
         )
 
     def _format_resource_response(self, uri: str, resource_response: Mapping[str, Any]) -> dict:
@@ -1115,6 +1185,7 @@ class McpServer:
             },
             self._format_prompt_response,
             meta=_meta,
+            cancellable=True,
         )
 
     def _format_prompt_response(self, prompt_response: Mapping[str, Any]) -> dict:
@@ -1293,10 +1364,10 @@ class McpServer:
         }
 
         annotations = getattr(func, "__mcp_tool_annotations__", None)
-        if annotations and self.context.protocol_version != LEGACY_SSE_PROTOCOL_VERSION:
+        if annotations:
             schema["annotations"] = annotations
 
-        # Add outputSchema if return type exists and is not None/Any/text-only
+        # Add outputSchema if return type exists and is not None/Any/text-only.
         if return_type and return_type is not type(None) and return_type is not Any and not self._type_is_plain_str(return_type):
             return_schema = self._type_to_json_schema(return_type)
 

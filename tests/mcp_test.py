@@ -14,7 +14,14 @@ from mcp.client.streamable_http import streamablehttp_client
 example_mcp = os.path.join(os.path.dirname(__file__), "..", "examples", "mcp_example.py")
 assert os.path.exists(example_mcp), f"not found: {example_mcp}"
 
-async def test_example_server(prefix: str, session: ClientSession):
+
+def local_source_env() -> dict[str, str]:
+    return {
+        **os.environ,
+        "PYTHONPATH": os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")),
+    }
+
+async def exercise_example_server(prefix: str, session: ClientSession):
     # Initialize the connection
     await session.initialize()
 
@@ -170,7 +177,7 @@ async def test_example_server(prefix: str, session: ClientSession):
     result = await session.call_tool("random_dict", arguments={"param": None})
     assert not result.isError, "random_dict with null should succeed"
 
-async def test_edge_cases(prefix: str, session: ClientSession):
+async def exercise_edge_cases(prefix: str, session: ClientSession):
     """Test edge cases and error conditions"""
     await session.initialize()
 
@@ -182,13 +189,18 @@ async def test_edge_cases(prefix: str, session: ClientSession):
         assert "not found" in e.error.message, "expected method not found error"
         print(f"[{prefix}] Non-existent tool error: {e.error.message}")
 
-    # Test missing required parameter (protocol error)
+    # Test missing required parameter. 2025-11-25 reports tool input validation
+    # as a tool execution error; older versions report a protocol error.
     try:
-        await session.call_tool("divide", arguments={"numerator": 42})
-        assert False, "should have raised on missing denominator"
+        result = await session.call_tool("divide", arguments={"numerator": 42})
+        assert result.isError, "missing denominator should return a tool error"
+        content = result.content[0]
+        assert isinstance(content, types.TextContent), "expected TextContent"
+        assert "missing required" in content.text, "expected missing parameter error"
+        print(f"[{prefix}] Missing param tool error: {content.text}")
     except McpError as e:
         assert "missing required" in e.error.message, "expected missing parameter error"
-        print(f"[{prefix}] Missing param error: {e.error.message}")
+        print(f"[{prefix}] Missing param protocol error: {e.error.message}")
 
     # Test division by zero (natural exception)
     result = await session.call_tool("divide", arguments={"numerator": 1, "denominator": 0})
@@ -235,35 +247,31 @@ def coverage_wrap(name: str, args: list[str]) -> list[str]:
         args = ["-m", "coverage", "run", f"--data-file=.coverage.{name}"] + args
     return args
 
-async def test_stdio():
+async def exercise_stdio():
     print("[stdio] Testing...")
-    env = {
-        **os.environ,
-        "PYTHONPATH": os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")),
-    }
     server_params = StdioServerParameters(
         command=sys.executable,
         args=coverage_wrap("stdio", [example_mcp, "--transport", "stdio"]),
-        env=env,
+        env=local_source_env(),
     )
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
-            await test_example_server("stdio", session)
-            await test_edge_cases("stdio", session)
+            await exercise_example_server("stdio", session)
+            await exercise_edge_cases("stdio", session)
 
-async def test_sse(address: str):
+async def exercise_sse(address: str):
     print("[sse] Testing...")
     async with sse_client(f"{address}/sse") as (read, write):
         async with ClientSession(read, write) as session:
-            await test_example_server("sse", session)
-            await test_edge_cases("sse", session)
+            await exercise_example_server("sse", session)
+            await exercise_edge_cases("sse", session)
 
-async def test_streamablehttp(address: str):
+async def exercise_streamablehttp(address: str):
     print("[streamable] Testing...")
     async with streamablehttp_client(f"{address}/mcp") as (read, write, session_callback):
         async with ClientSession(read, write) as session:
-            await test_example_server("streamable", session)
-            await test_edge_cases("streamable", session)
+            await exercise_example_server("streamable", session)
+            await exercise_edge_cases("streamable", session)
 
 def find_available_port():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -272,7 +280,7 @@ def find_available_port():
     sock.close()
     return port
 
-async def test_serve():
+async def exercise_serve():
     print("[serve] Testing...")
 
     # Start example MCP server as subprocess
@@ -283,18 +291,19 @@ async def test_serve():
         text=True,
         encoding="utf-8",
         bufsize=1,
+        env=local_source_env(),
     )
     try:
         await asyncio.sleep(0.5)  # Wait for server to start
-        await test_sse(address)
-        await test_streamablehttp(address)
+        await exercise_sse(address)
+        await exercise_streamablehttp(address)
     finally:
         print("[serve] Terminating example MCP server")
         process.stdin.close()  # type: ignore
         process.wait()
     pass
 
-async def test_serve_oauth():
+async def exercise_serve_oauth():
     print("[serve-oauth] Testing...")
 
     address = f"http://127.0.0.1:{find_available_port()}"
@@ -322,6 +331,7 @@ async def test_serve_oauth():
         text=True,
         encoding="utf-8",
         bufsize=1,
+        env=local_source_env(),
     )
     try:
         await asyncio.sleep(0.5)
@@ -349,7 +359,10 @@ async def test_serve_oauth():
 
         whoami = requests.post(
             f"{address}/mcp",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "MCP-Protocol-Version": "2025-06-18",
+            },
             json={
                 "jsonrpc": "2.0",
                 "method": "tools/call",
@@ -365,9 +378,12 @@ async def test_serve_oauth():
         process.wait()
 
 async def main():
-    await test_serve()
-    await test_serve_oauth()
-    await test_stdio()
+    await exercise_serve()
+    await exercise_serve_oauth()
+    await exercise_stdio()
+
+def test_mcp_transports():
+    asyncio.run(main())
 
 if __name__ == "__main__":
     import os

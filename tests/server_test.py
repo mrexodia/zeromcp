@@ -83,6 +83,38 @@ def test_streamable_http_notifications_have_no_body():
     print("✓ PASS")
 
 
+def test_streamable_http_session_id_is_server_generated():
+    print("Testing server-generated Streamable HTTP session IDs...")
+    initialize = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"},
+        },
+        "id": 1,
+    }
+
+    with run_server(require_streamable_http_session=True) as (base_url, server):
+        resp = requests.post(
+            f"{base_url}/mcp",
+            headers={"Mcp-Session-Id": "client-chosen-session"},
+            json=initialize,
+        )
+        session_id = resp.headers.get("Mcp-Session-Id")
+        assert session_id and session_id != "client-chosen-session", "server should generate initialize session IDs"
+        assert server.has_http_session(session_id), "generated session should be registered"
+        assert not server.has_http_session("client-chosen-session"), "client-provided initialize session should be ignored"
+
+        bad = requests.post(f"{base_url}/mcp", headers={"Mcp-Session-Id": "client-chosen-session"}, json=PING_JSON)
+        assert bad.status_code == 404, "client-chosen session ID should not be accepted"
+
+        good = requests.post(f"{base_url}/mcp", headers={"Mcp-Session-Id": session_id}, json=PING_JSON)
+        assert good.status_code == 200, "server-generated session ID should be accepted"
+    print("✓ PASS")
+
+
 def test_streamable_http_accepts_client_response():
     print("Testing Streamable HTTP client response input...")
     with run_server() as (base_url, _):
@@ -116,6 +148,60 @@ def test_protocol_version_header_validation():
     print("✓ PASS")
 
 
+def test_streamable_http_protocol_defaults_and_session_reuse():
+    print("Testing Streamable HTTP protocol default and session protocol reuse...")
+    initialize = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"},
+        },
+        "id": 1,
+    }
+
+    with run_server() as (base_url, server):
+        @server.tool
+        def protocol_info() -> dict[str, str | None]:
+            return {"protocol": server.context.protocol_version}
+
+        no_header = requests.post(f"{base_url}/mcp", json={
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "protocol_info", "arguments": {}},
+            "id": 1,
+        })
+        assert no_header.status_code == 200
+        no_header_result = no_header.json()["result"]
+        assert no_header_result["structuredContent"]["protocol"] == "2025-03-26"
+        assert json.loads(no_header_result["content"][0]["text"])["protocol"] == "2025-03-26"
+
+        header_init = requests.post(
+            f"{base_url}/mcp",
+            headers={"MCP-Protocol-Version": "2025-03-26"},
+            json=initialize,
+        )
+        assert header_init.json()["result"]["protocolVersion"] == "2025-11-25", "initialize should negotiate from the JSON-RPC body"
+
+        init = requests.post(f"{base_url}/mcp", json=initialize)
+        session_id = init.headers.get("Mcp-Session-Id")
+        assert session_id
+        followup = requests.post(
+            f"{base_url}/mcp",
+            headers={"Mcp-Session-Id": session_id},
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "protocol_info", "arguments": {}},
+                "id": 2,
+            },
+        )
+        assert followup.status_code == 200
+        assert followup.json()["result"]["structuredContent"]["protocol"] == "2025-11-25"
+    print("✓ PASS")
+
+
 def test_tool_protocol_errors():
     print("Testing tool protocol errors...")
     with run_server() as (base_url, _):
@@ -127,6 +213,89 @@ def test_tool_protocol_errors():
         })
         data = resp.json()
         assert data["error"]["code"] == -32601
+    print("✓ PASS")
+
+
+def test_stdio_preserves_negotiated_protocol_version():
+    print("Testing stdio negotiated protocol version...")
+    server = McpServer("stdio-protocol-test")
+
+    @server.tool
+    def needs_arg(value: int) -> int:
+        return value
+
+    initialize = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"},
+        },
+        "id": 1,
+    }).encode("utf-8") + b"\n"
+    call = json.dumps({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "needs_arg", "arguments": {}},
+        "id": 2,
+    }).encode("utf-8") + b"\n"
+
+    stdout = io.BytesIO()
+    server.stdio(io.BytesIO(initialize + call), stdout)
+    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+    assert responses[0]["result"]["protocolVersion"] == "2025-11-25"
+    tool_result = responses[1]["result"]
+    assert tool_result["isError"]
+    assert "missing required" in tool_result["content"][0]["text"]
+    print("✓ PASS")
+
+
+def test_protocol_specific_tool_argument_errors():
+    print("Testing protocol-specific tool argument errors...")
+    server = McpServer("tool-error-test")
+
+    @server.tool
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    request = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "add", "arguments": {"a": 1}},
+        "id": 1,
+    }
+
+    with server._context_scope(protocol_version="2025-06-18"):
+        old_response = server._dispatch_mcp(request)
+    assert old_response is not None
+    assert old_response["error"]["code"] == -32602, "2025-06-18 treats invalid tool args as protocol errors"
+
+    with server._context_scope(protocol_version="2025-11-25"):
+        new_response = server._dispatch_mcp(request)
+    assert new_response is not None
+    result = new_response["result"]
+    assert result["isError"] is True, "2025-11-25 treats invalid tool args as tool execution errors"
+    assert "missing required" in result["content"][0]["text"]
+    print("✓ PASS")
+
+
+def test_tool_schema_includes_future_fields_for_all_versions():
+    print("Testing tool schema includes future fields for all protocol versions...")
+    server = McpServer("schema-version-test")
+
+    @server.tool(read_only=True)
+    def number() -> int:
+        return 1
+
+    request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
+
+    for protocol_version in ("2024-11-05", "2025-03-26", "2025-06-18"):
+        with server._context_scope(protocol_version=protocol_version):
+            schema = server._dispatch_mcp(request)["result"]["tools"][0]
+        assert schema["annotations"]["readOnlyHint"] is True
+        assert schema["outputSchema"]["properties"]["result"]["type"] == "integer"
     print("✓ PASS")
 
 
@@ -345,20 +514,79 @@ def test_list_cursor_params_are_accepted():
     print("✓ PASS")
 
 
+def test_resource_and_prompt_cancellation():
+    print("Testing resource and prompt cancellation...")
+    import threading
+    import time
+
+    server = McpServer("cancel-non-tool-test")
+    resource_started = threading.Event()
+    prompt_started = threading.Event()
+
+    @server.resource("example://slow")
+    def slow_resource():
+        resource_started.set()
+        while True:
+            server.check_cancelled()
+            time.sleep(0.01)
+
+    @server.prompt
+    def slow_prompt():
+        prompt_started.set()
+        while True:
+            server.check_cancelled()
+            time.sleep(0.01)
+
+    def run_and_cancel(request: dict, started: threading.Event):
+        result = {}
+
+        def call():
+            result["response"] = server._dispatch_mcp(request)
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        assert started.wait(2), "request should have started"
+
+        server._dispatch_mcp({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": request["id"]},
+        })
+        thread.join(2)
+
+        assert not thread.is_alive(), "request should stop after cancellation"
+        assert result["response"] is None, "cancelled requests should not receive JSON-RPC responses"
+
+    run_and_cancel({
+        "jsonrpc": "2.0",
+        "method": "resources/read",
+        "params": {"uri": "example://slow"},
+        "id": "resource-read",
+    }, resource_started)
+    run_and_cancel({
+        "jsonrpc": "2.0",
+        "method": "prompts/get",
+        "params": {"name": "slow_prompt", "arguments": {}},
+        "id": "prompt-get",
+    }, prompt_started)
+    print("✓ PASS")
+
+
 def test_stdio_async_cancellation():
     print("Testing async stdio cancellation...")
     import asyncio
     import threading
+    import time
 
     server = McpServer("stdio-cancel-test")
     started = threading.Event()
 
     @server.tool
-    async def slow_tool():
+    def slow_tool():
         started.set()
         while True:
             server.check_cancelled()
-            await asyncio.sleep(0.01)
+            time.sleep(0.01)
 
     call = json.dumps({
         "jsonrpc": "2.0",
@@ -387,9 +615,7 @@ def test_stdio_async_cancellation():
 
     stdout = io.BytesIO()
     asyncio.run(server.stdio_async(cast(BinaryIO, Stdin()), stdout))
-    responses = [json.loads(line) for line in stdout.getvalue().splitlines()]
-    assert len(responses) == 1
-    assert responses[0]["error"]["code"] == -32800
+    assert stdout.getvalue() == b"", "cancelled requests should not receive JSON-RPC responses"
     print("✓ PASS")
 
 
@@ -429,7 +655,63 @@ def test_cancelled_helper():
     thread.join(2)
 
     assert not thread.is_alive(), "tool should stop after cancellation"
-    assert result["response"]["error"]["code"] == -32800
+    assert result["response"] is None, "cancelled requests should not receive JSON-RPC responses"
+    print("✓ PASS")
+
+
+def test_anonymous_http_cancellation_is_isolated():
+    print("Testing anonymous HTTP cancellation isolation...")
+    import threading
+    import time
+
+    with run_server() as (base_url, server):
+        started = threading.Event()
+        release = threading.Event()
+        result = {}
+
+        @server.tool
+        def slow_tool() -> str:
+            started.set()
+            while not release.wait(0.01):
+                server.check_cancelled()
+            return "done"
+
+        def call_tool():
+            result["response"] = requests.post(
+                f"{base_url}/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": "slow_tool", "arguments": {}},
+                    "id": 1,
+                },
+                timeout=5,
+            )
+
+        thread = threading.Thread(target=call_tool, daemon=True)
+        thread.start()
+        try:
+            assert started.wait(2), "tool should have started"
+            cancel = requests.post(
+                f"{base_url}/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": {"requestId": 1},
+                },
+                timeout=5,
+            )
+            assert cancel.status_code == 202
+            time.sleep(0.1)
+            assert thread.is_alive(), "anonymous HTTP cancellation should not affect another request"
+        finally:
+            release.set()
+            thread.join(2)
+
+        assert not thread.is_alive(), "tool request should finish after release"
+        response = result["response"]
+        assert response.status_code == 200
+        assert response.json()["result"]["content"][0]["text"] == "done"
     print("✓ PASS")
 
 
@@ -717,17 +999,24 @@ def run_all_tests():
     try:
         test_streamable_http_session_id()
         test_streamable_http_notifications_have_no_body()
+        test_streamable_http_session_id_is_server_generated()
         test_streamable_http_accepts_client_response()
         test_protocol_version_header_validation()
+        test_streamable_http_protocol_defaults_and_session_reuse()
         test_tool_protocol_errors()
+        test_stdio_preserves_negotiated_protocol_version()
+        test_protocol_specific_tool_argument_errors()
+        test_tool_schema_includes_future_fields_for_all_versions()
         test_str_tool_result_is_unstructured_text()
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()
         test_tool_annotations()
         test_oauth_resource_server()
         test_list_cursor_params_are_accepted()
+        test_resource_and_prompt_cancellation()
         test_stdio_async_cancellation()
         test_cancelled_helper()
+        test_anonymous_http_cancellation_is_isolated()
         test_cors_permissive()
         test_cors_restrictive()
         test_cors_local()

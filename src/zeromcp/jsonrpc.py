@@ -32,6 +32,9 @@ class JsonRpcException(Exception):
         self.message = message
         self.data = data
 
+class JsonRpcNoResponse(Exception):
+    """Signal that a request was intentionally abandoned without a JSON-RPC response."""
+
 class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
@@ -69,6 +72,8 @@ class JsonRpcRegistry:
                 "result": result,
                 "id": request_id,
             }
+        except JsonRpcNoResponse:
+            return None
         except JsonRpcException as e:
             if is_notification:
                 return None
@@ -101,6 +106,8 @@ class JsonRpcRegistry:
                 "result": result,
                 "id": request_id,
             }
+        except JsonRpcNoResponse:
+            return None
         except JsonRpcException as e:
             if is_notification:
                 return None

@@ -130,7 +130,7 @@ def matches_response(actual: dict | None, expected: dict | None) -> bool:
 
     return True
 
-def test_rpc(request: Any, expected_response: dict | None = None, description: str = ""):
+def check_rpc(request: Any, expected_response: dict | None = None, description: str = ""):
     """Helper to test RPC calls"""
     print(f"\n{'='*60}")
     print(f"Test: {description}")
@@ -164,7 +164,7 @@ def test_rpc(request: Any, expected_response: dict | None = None, description: s
     return result
 
 
-def test_async_method_dispatch():
+def check_async_method_dispatch():
     print(f"\n{'='*60}")
     print("Test: async method dispatch")
 
@@ -178,7 +178,7 @@ def test_async_method_dispatch():
     print("✓ PASS")
 
 
-def test_current_request_id_is_stack_safe():
+def check_current_request_id_is_stack_safe():
     print(f"\n{'='*60}")
     print("Test: current_request_id is restored across nested dispatch")
 
@@ -222,132 +222,132 @@ def run_all_tests():
     # ========================================
 
     # Positional parameters
-    test_rpc(
+    check_rpc(
         {"jsonrpc": "2.0", "method": "subtract", "params": [42, 23], "id": 1},
         {"jsonrpc": "2.0", "result": 19, "id": 1},
         "Positional params - subtract(42, 23)"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [23, 42], "id": 2}',
         {"jsonrpc": "2.0", "result": -19, "id": 2},
         "Positional params - subtract(23, 42)"
     )
 
     # Named parameters
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": {"subtrahend": 23, "minuend": 42}, "id": 3}',
         {"jsonrpc": "2.0", "result": 19, "id": 3},
         "Named params - order independent (1)"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": 23}, "id": 4}',
         {"jsonrpc": "2.0", "result": 19, "id": 4},
         "Named params - order independent (2)"
     )
 
     # Notifications (no response)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "update", "params": [1,2,3,4,5]}',
         None,
         "Notification - update (no id)"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "foobar"}',
         None,
         "Notification - foobar (no params, no id)"
     )
 
     # Non-existent method
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "does_not_exist", "id": "1"}',
         {"jsonrpc": "2.0", "error": {"code": -32601, "message": "regex:Method.*not found"}, "id": "1"},
         "Non-existent method error"
     )
 
     # Invalid JSON - use regex to match error since different parsers give different messages
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "foobar, "params": "bar", "baz]',
         {"jsonrpc": "2.0", "error": {"code": -32700, "message": "JSON parse error", "data": "regex:Expecting"}, "id": None},
         "Parse error - invalid JSON"
     )
 
-    test_rpc(
+    check_rpc(
         1234,
         {"jsonrpc": "2.0", "error": {"code": -32700, "message": "JSON parse error", "data": "regex:object must be"}, "id": None},
         "Parse error - invalid JSON"
     )
 
     # Invalid Request object - method is not a string
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": 1, "params": "bar"}',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'method' must be a string"}, "id": None},
         "Invalid Request - method is number"
     )
 
     # Missing jsonrpc version
-    test_rpc(
+    check_rpc(
         '{"method": "subtract", "params": [1, 2], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'jsonrpc' must be '2.0'"}, "id": None},
         "Invalid Request - missing jsonrpc field"
     )
 
     # Wrong jsonrpc version
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "1.0", "method": "subtract", "params": [1, 2], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'jsonrpc' must be '2.0'"}, "id": None},
         "Invalid Request - wrong jsonrpc version"
     )
 
     # Missing method
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "params": [1, 2], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'method' is required"}, "id": None},
         "Invalid Request - missing method"
     )
 
     # Empty array (not valid single request)
-    test_rpc(
+    check_rpc(
         '[]',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: must be a JSON object"}, "id": None},
         "Invalid Request - empty array"
     )
 
     # Non-object request
-    test_rpc(
+    check_rpc(
         '"not an object"',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: must be a JSON object"}, "id": None},
         "Invalid Request - string instead of object"
     )
 
-    test_rpc(
+    check_rpc(
         '123',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: must be a JSON object"}, "id": None},
         "Invalid Request - number instead of object"
     )
 
     # Request with id: null (valid request, not a notification)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "foobar", "id": null}',
         {"jsonrpc": "2.0", "result": "bar", "id": None},
         "Valid request with id: null"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "foobar", "id": 1.5}',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'id' must be a string, integer, or null"}, "id": None},
         "Invalid request with float id"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "foobar", "id": true}',
         {"jsonrpc": "2.0", "error": {"code": -32600, "message": "Invalid request: 'id' must be a string, integer, or null"}, "id": None},
         "Invalid request with boolean id"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "async_foobar", "id": "async-id"}',
         {"jsonrpc": "2.0", "result": "async:async-id", "id": "async-id"},
         "Async method dispatch"
@@ -358,68 +358,68 @@ def run_all_tests():
     # ========================================
 
     # Wrong number of positional params - too few
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [42], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: expected at least 2 arguments, got 1"}, "id": 1},
         "Invalid params - too few positional arguments"
     )
 
     # Wrong number of positional params - too many
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [42, 23, 10], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: expected at most 2 arguments, got 3"}, "id": 1},
         "Invalid params - too many positional arguments"
     )
 
     # Missing required named param
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42}, "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: missing required parameters: ['subtrahend']"}, "id": 1},
         "Invalid params - missing required parameter"
     )
 
     # Extra named param
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": 23, "extra": 1}, "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: unexpected parameters: ['extra']"}, "id": 1},
         "Invalid params - unexpected parameter"
     )
 
     # Wrong type - string instead of int
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [42, "not a number"], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: subtrahend expected int, got str"}, "id": 1},
         "Invalid params - wrong type (str instead of int)"
     )
 
     # Wrong type - list instead of int
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": [1, 2]}, "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: subtrahend expected int, got list"}, "id": 1},
         "Invalid params - wrong type (list instead of int)"
     )
 
     # Null for non-optional param
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [42, null], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: subtrahend cannot be null"}, "id": 1},
         "Invalid params - null for non-optional parameter"
     )
 
     # Params is invalid type (not array or object)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": "invalid", "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: must be array or object"}, "id": 1},
         "Invalid params - string instead of array/object"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": 123, "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: must be array or object"}, "id": 1},
         "Invalid params - number instead of array/object"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": null, "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Missing required params"}, "id": 1},
         "Invalid params - null for required params"
@@ -430,49 +430,49 @@ def run_all_tests():
     # ========================================
 
     # Function with default param - omit optional param (positional)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "greet", "params": ["Alice"], "id": 1}',
         {"jsonrpc": "2.0", "result": "Hello, Alice!", "id": 1},
         "Default param - omit optional (positional)"
     )
 
     # Function with default param - provide optional param (positional)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "greet", "params": ["Alice", "Hi"], "id": 1}',
         {"jsonrpc": "2.0", "result": "Hi, Alice!", "id": 1},
         "Default param - provide optional (positional)"
     )
 
     # Function with default param - omit optional param (named)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "greet", "params": {"name": "Bob"}, "id": 1}',
         {"jsonrpc": "2.0", "result": "Hello, Bob!", "id": 1},
         "Default param - omit optional (named)"
     )
 
     # Function with default param - provide optional param (named)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "greet", "params": {"name": "Bob", "greeting": "Hey"}, "id": 1}',
         {"jsonrpc": "2.0", "result": "Hey, Bob!", "id": 1},
         "Default param - provide optional (named)"
     )
 
     # Function with no params - omit params field
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "get_data", "id": 1}',
         {"jsonrpc": "2.0", "result": ["hello", 5], "id": 1},
         "No params function - params field omitted"
     )
 
     # Function with no params - empty array
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "get_data", "params": [], "id": 1}',
         {"jsonrpc": "2.0", "result": ["hello", 5], "id": 1},
         "No params function - empty array"
     )
 
     # Function with no params - empty object
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "get_data", "params": {}, "id": 1}',
         {"jsonrpc": "2.0", "result": ["hello", 5], "id": 1},
         "No params function - empty object"
@@ -483,28 +483,28 @@ def run_all_tests():
     # ========================================
 
     # Union type - int
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "union_test", "params": [123], "id": 1}',
         {"jsonrpc": "2.0", "result": "ID: 123", "id": 1},
         "Union type (int | str) - int value"
     )
 
     # Union type - str
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "union_test", "params": ["abc"], "id": 1}',
         {"jsonrpc": "2.0", "result": "ID: abc", "id": 1},
         "Union type (int | str) - str value"
     )
 
     # Union type - invalid type
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "union_test", "params": [[1, 2, 3]], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: id union does not contain list"}, "id": 1},
         "Union type (int | str) - invalid list"
     )
 
     # Union type - null
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "union_test", "params": [null], "id": 1}',
         {"jsonrpc": "2.0", "result": "ID: <nil>", "id": 1},
         "Union type (int | str | None) - null value"
@@ -515,14 +515,14 @@ def run_all_tests():
     # ========================================
 
     # Optional - provide value
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "process_optional", "params": [42], "id": 1}',
         {"jsonrpc": "2.0", "result": "Got: 42", "id": 1},
         "Optional type - provide value"
     )
 
     # Optional - provide null
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "process_optional", "params": [null], "id": 1}',
         {"jsonrpc": "2.0", "result": "Got: None", "id": 1},
         "Optional type - provide null"
@@ -533,55 +533,55 @@ def run_all_tests():
     # ========================================
 
     # list[T] - valid list
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "list_test", "params": [["a", "b", "c"]], "id": 1}',
         {"jsonrpc": "2.0", "result": 3, "id": 1},
         "Generic type list[str] - valid list (no inner validation)"
     )
 
     # list[T] - wrong outer type
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "list_test", "params": ["not a list"], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: items expected list, got str"}, "id": 1},
         "Generic type list[str] - wrong outer type"
     )
 
     # Point TypedDict - valid dict
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "point_pretty", "params": [{"x": 10, "y": 20}], "id": 1}',
         {"jsonrpc": "2.0", "result": "Point(x=10, y=20)", "id": 1},
         "TypedDict Point - valid dict"
     )
 
     # Point TypedDict - wrong outer type
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "point_pretty", "params": ["not a dict"], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: p expected dict, got str"}, "id": 1},
         "TypedDict Point - wrong outer type"
     )
 
     # Convert from int to float
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "round_float", "params": [3], "id": 1}',
         {"jsonrpc": "2.0", "result": 3, "id": 1},
         "Convert int to float for float parameter"
     )
 
     # Any type - various inputs
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "python_repr", "params": [42], "id": 1}',
         {"jsonrpc": "2.0", "result": "42", "id": 1},
         "Any type - int value"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "python_repr", "params": ["hello"], "id": 1}',
         {"jsonrpc": "2.0", "result": "'hello'", "id": 1},
         "Any type - str value"
     )
 
     # Unspecified types (unknown) - should accept anything
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "unknown", "params": [10, 20], "id": 1}',
         {"jsonrpc": "2.0", "result": 30, "id": 1},
         "Unknown parameter types - accept any"
@@ -592,37 +592,40 @@ def run_all_tests():
     # ========================================
 
     # Notification with error (should return None, no response)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "does_not_exist"}',
         None,
         "Notification - error does not produce response"
     )
 
     # Notification with invalid params (should return None, no response)
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [1]}',
         None,
         "Notification - invalid params does not produce response"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "exception", "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32603, "message": "regex:Python exception"}, "id": 1},
         "Method that raises python exception"
     )
 
-    test_rpc(
+    check_rpc(
         '{"jsonrpc": "2.0", "method": "exception"}',
         None,
         "Notification - method that raises python exception"
     )
 
-    test_async_method_dispatch()
-    test_current_request_id_is_stack_safe()
+    check_async_method_dispatch()
+    check_current_request_id_is_stack_safe()
 
     print("\n" + "="*60)
     print("ALL TESTS PASSED! ✓")
     print("="*60)
+
+def test_jsonrpc_compliance():
+    run_all_tests()
 
 if __name__ == "__main__":
     run_all_tests()
