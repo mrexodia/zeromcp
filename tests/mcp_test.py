@@ -1,7 +1,12 @@
 import os
 import sys
+import json
+import time
+import hmac
+import base64
 import socket
 import asyncio
+import hashlib
 import subprocess
 
 import requests
@@ -377,9 +382,102 @@ async def exercise_serve_oauth():
         process.stdin.close()  # type: ignore
         process.wait()
 
+def make_jwt_hs256(secret: bytes, claims: dict) -> str:
+    def b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = b64url(json.dumps(claims).encode())
+    signature = b64url(hmac.new(secret, f"{header}.{payload}".encode(), hashlib.sha256).digest())
+    return f"{header}.{payload}.{signature}"
+
+
+async def exercise_serve_oauth_jwt():
+    print("[serve-oauth-jwt] Testing...")
+
+    address = f"http://127.0.0.1:{find_available_port()}"
+    resource = f"{address}/mcp"
+    secret = b"jwt-test-secret"
+    process = subprocess.Popen(
+        [sys.executable]
+        + coverage_wrap(
+            "serve-oauth-jwt",
+            [
+                example_mcp,
+                "--transport",
+                address,
+                "--oauth",
+                "--oauth-jwt-secret",
+                secret.decode(),
+                "--oauth-resource",
+                resource,
+                "--oauth-scope",
+                "mcp",
+            ],
+        ),
+        stdin=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+        env=local_source_env(),
+    )
+    try:
+        await asyncio.sleep(0.5)
+        claims = {"sub": "jwt-user", "aud": resource, "scope": "mcp", "exp": time.time() + 60}
+
+        whoami = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}},
+            "id": 1,
+        }
+        authorized = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, claims)}"},
+            json=whoami,
+        )
+        assert authorized.status_code == 200
+        structured = authorized.json()["result"]["structuredContent"]
+        assert structured["subject"] == "jwt-user"
+        assert structured["claims"]["aud"] == resource
+
+        expired = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'exp': time.time() - 60})}"},
+            json=whoami,
+        )
+        assert expired.status_code == 401, "expired JWT should be rejected"
+
+        forged = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(b'wrong-secret', claims)}"},
+            json=whoami,
+        )
+        assert forged.status_code == 401, "JWT with a wrong signature should be rejected"
+
+        wrong_audience = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'aud': 'https://other.example'})}"},
+            json=whoami,
+        )
+        assert wrong_audience.status_code == 401, "JWT for another resource should be rejected"
+
+        missing_scope = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'scope': 'other'})}"},
+            json=whoami,
+        )
+        assert missing_scope.status_code == 403, "JWT without the required scope should be rejected"
+    finally:
+        print("[serve-oauth-jwt] Terminating example MCP server")
+        process.stdin.close()  # type: ignore
+        process.wait()
+
+
 async def main():
     await exercise_serve()
     await exercise_serve_oauth()
+    await exercise_serve_oauth_jwt()
     await exercise_stdio()
 
 def test_mcp_transports():

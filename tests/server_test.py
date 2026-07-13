@@ -115,6 +115,84 @@ def test_streamable_http_session_id_is_server_generated():
     print("✓ PASS")
 
 
+def test_streamable_http_session_delete():
+    print("Testing Streamable HTTP session termination...")
+    initialize = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"},
+        },
+        "id": 1,
+    }
+
+    with run_server(require_streamable_http_session=True) as (base_url, server):
+        resp = requests.post(f"{base_url}/mcp", json=initialize)
+        session_id = resp.headers.get("Mcp-Session-Id")
+        assert session_id
+
+        missing = requests.delete(f"{base_url}/mcp")
+        assert missing.status_code == 400, "DELETE without Mcp-Session-Id should fail"
+
+        unknown = requests.delete(f"{base_url}/mcp", headers={"Mcp-Session-Id": "unknown-session"})
+        assert unknown.status_code == 404, "DELETE with an unknown session should fail"
+
+        deleted = requests.delete(f"{base_url}/mcp", headers={"Mcp-Session-Id": session_id})
+        assert deleted.status_code == 204, "DELETE with a known session should terminate it"
+        assert not server.has_http_session(session_id)
+
+        after = requests.post(f"{base_url}/mcp", headers={"Mcp-Session-Id": session_id}, json=PING_JSON)
+        assert after.status_code == 404, "terminated sessions should not be accepted"
+
+        other_path = requests.delete(f"{base_url}/sse", headers={"Mcp-Session-Id": session_id})
+        assert other_path.status_code == 405, "DELETE is only supported on /mcp"
+
+    # Without session enforcement, DELETE still discards the remembered protocol version.
+    with run_server() as (base_url, server):
+        resp = requests.post(f"{base_url}/mcp", json=initialize)
+        session_id = resp.headers.get("Mcp-Session-Id")
+        assert session_id
+        assert server.get_http_session_protocol(session_id) == "2025-06-18"
+
+        deleted = requests.delete(f"{base_url}/mcp", headers={"Mcp-Session-Id": session_id})
+        assert deleted.status_code == 204
+        assert server.get_http_session_protocol(session_id) is None
+
+        again = requests.delete(f"{base_url}/mcp", headers={"Mcp-Session-Id": session_id})
+        assert again.status_code == 404, "repeated DELETE should report the session as gone"
+    print("✓ PASS")
+
+
+def test_http_session_lru_bound():
+    print("Testing HTTP session LRU bound...")
+    initialize = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"},
+        },
+        "id": 1,
+    }
+
+    with run_server(require_streamable_http_session=True, max_http_sessions=2) as (base_url, server):
+        session_ids = []
+        for i in range(3):
+            resp = requests.post(f"{base_url}/mcp", json={**initialize, "id": i + 1})
+            session_ids.append(resp.headers["Mcp-Session-Id"])
+
+        assert not server.has_http_session(session_ids[0]), "oldest session should be evicted"
+        assert server.has_http_session(session_ids[1])
+        assert server.has_http_session(session_ids[2])
+
+        evicted = requests.post(f"{base_url}/mcp", headers={"Mcp-Session-Id": session_ids[0]}, json=PING_JSON)
+        assert evicted.status_code == 404, "evicted sessions should require re-initialization"
+    print("✓ PASS")
+
+
 def test_streamable_http_accepts_client_response():
     print("Testing Streamable HTTP client response input...")
     with run_server() as (base_url, _):
@@ -131,7 +209,7 @@ def test_streamable_http_accepts_client_response():
 def test_protocol_version_header_validation():
     print("Testing protocol version header validation...")
     with run_server() as (base_url, _):
-        for version in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"):
+        for version in ("2025-03-26", "2025-06-18", "2025-11-25"):
             resp = requests.post(
                 f"{base_url}/mcp",
                 headers={"MCP-Protocol-Version": version},
@@ -139,12 +217,14 @@ def test_protocol_version_header_validation():
             )
             assert resp.status_code == 200, f"{version} should be accepted"
 
-        resp = requests.post(
-            f"{base_url}/mcp",
-            headers={"MCP-Protocol-Version": "1900-01-01"},
-            json=PING_JSON,
-        )
-        assert resp.status_code == 400
+        # 2024-11-05 predates Streamable HTTP; it is served by /sse, not /mcp.
+        for version in ("2024-11-05", "1900-01-01"):
+            resp = requests.post(
+                f"{base_url}/mcp",
+                headers={"MCP-Protocol-Version": version},
+                json=PING_JSON,
+            )
+            assert resp.status_code == 400, f"{version} should be rejected"
     print("✓ PASS")
 
 
@@ -1000,6 +1080,8 @@ def run_all_tests():
         test_streamable_http_session_id()
         test_streamable_http_notifications_have_no_body()
         test_streamable_http_session_id_is_server_generated()
+        test_streamable_http_session_delete()
+        test_http_session_lru_bound()
         test_streamable_http_accepts_client_response()
         test_protocol_version_header_validation()
         test_streamable_http_protocol_defaults_and_session_reuse()

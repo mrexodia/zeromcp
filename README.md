@@ -248,6 +248,27 @@ async def slow_lookup(key: str) -> str:
     return key
 ```
 
+## Cancellation
+
+Long-running tools, resources, and prompts can poll `mcp.check_cancelled()` to honor `notifications/cancelled`. When the client cancels, the call is abandoned without a JSON-RPC response, as the spec requires:
+
+```python
+@mcp.tool
+def slow_count(limit: int = 10) -> str:
+    for _ in range(limit):
+        mcp.check_cancelled()
+        time.sleep(1)
+    return f"Counted to {limit}"
+```
+
+Cancellations are matched per transport session. Over Streamable HTTP the cancellation notification arrives as a separate POST, so the client must echo the `Mcp-Session-Id` header from `initialize` (the spec requires clients to do this). Requests from clients that omit the header cannot be correlated — JSON-RPC ids are only unique within a session, so matching bare ids would let one client cancel another's request — and such cancellations are ignored, which the spec permits.
+
+## HTTP sessions
+
+zeromcp assigns an `Mcp-Session-Id` on every successful Streamable HTTP `initialize` and remembers the negotiated protocol version for that session. By default the session id is advisory; set `mcp.require_streamable_http_session = True` to reject non-initialize requests without a valid session (400/404 per spec).
+
+Clients can terminate a session with `DELETE /mcp` and the `Mcp-Session-Id` header. Session state is also bounded by `mcp.max_http_sessions` (default 1024) with least-recently-used eviction; requests with an evicted session id receive 404, and per the spec the client then starts a new session with a fresh `initialize`. With OAuth configured, unauthenticated requests are rejected before any session is created.
+
 ## OAuth resource server
 
 zeromcp can act as an MCP OAuth resource server. Token validation is provided by your application:
@@ -273,10 +294,18 @@ def verify_token(token: str, resource: str) -> McpAuthInfo | None:
 
 When OAuth is configured, HTTP MCP requests require `Authorization: Bearer <token>`. zeromcp exposes OAuth Protected Resource Metadata at `/.well-known/oauth-protected-resource`.
 
+When no `resource_metadata_url` is given, the metadata URL advertised in `WWW-Authenticate` is inferred from the request's `Host` header. This works out of the box for direct connections, but behind a reverse proxy you should set `resource_metadata_url` (and `resource`) explicitly so the advertised URLs match your public address.
+
 The example server includes a static-token OAuth verifier for local testing:
 
 ```bash
 uv run examples/mcp_example.py --transport http://127.0.0.1:5001 --oauth --oauth-token dev-token --oauth-resource http://127.0.0.1:5001/mcp
+```
+
+It can also validate HS256 JWTs (`sub`, `scope`, `exp`, `nbf`, and `aud` claims) using only the standard library — see `verify_jwt_hs256` in `examples/mcp_example.py`:
+
+```bash
+uv run examples/mcp_example.py --transport http://127.0.0.1:5001 --oauth --oauth-jwt-secret my-secret --oauth-resource http://127.0.0.1:5001/mcp
 ```
 
 ## CORS

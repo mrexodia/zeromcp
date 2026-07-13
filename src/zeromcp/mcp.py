@@ -10,6 +10,7 @@ import threading
 import traceback
 import asyncio
 import contextvars
+from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
@@ -20,6 +21,8 @@ from io import BufferedIOBase
 
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse
 
+# Deliberately not the newest supported version: older, half-compliant clients
+# are more likely to work when negotiation falls back to 2025-06-18.
 MCP_PROTOCOL_VERSION = "2025-06-18"
 DEFAULT_STREAMABLE_HTTP_PROTOCOL_VERSION = "2025-03-26"
 STREAMABLE_HTTP_PROTOCOL_VERSIONS = {DEFAULT_STREAMABLE_HTTP_PROTOCOL_VERSION, MCP_PROTOCOL_VERSION, "2025-11-25"}
@@ -225,6 +228,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         try:
             auth_info = config.verify_token(token.strip(), config.resource)
         except Exception:
+            traceback.print_exc()
             auth_info = None
         if auth_info is None:
             self._send_oauth_error(401, "Invalid access token", error="invalid_token", scope=" ".join(config.required_scopes) or None)
@@ -335,10 +339,25 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self._check_api_request():
             return
-        ok, _ = self._check_oauth_for_path(urlparse(self.path).path)
+        path = urlparse(self.path).path
+        ok, _ = self._check_oauth_for_path(path)
         if not ok:
             return
-        self.send_error(405, "Method Not Allowed")
+        if path != "/mcp":
+            self.send_error(405, "Method Not Allowed")
+            return
+
+        # Explicit session termination (MCP Streamable HTTP session management).
+        session_id = self.headers.get("Mcp-Session-Id")
+        if not session_id:
+            self.send_error(400, "Missing Mcp-Session-Id")
+            return
+        if not self.mcp_server.unregister_http_session(session_id):
+            self.send_error(404, "Session not found")
+            return
+        self.send_response(204)
+        self.send_cors_headers()
+        self.end_headers()
 
     def _read_body(self) -> bytes | None:
         if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
@@ -482,8 +501,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_mcp_post(self, body: bytes, auth_info: McpAuthInfo | None = None):
+        # The MCP-Protocol-Version header only exists for Streamable HTTP protocol
+        # versions; 2024-11-05 clients are served by the legacy /sse transport.
         protocol_version = self.headers.get("MCP-Protocol-Version")
-        if protocol_version is not None and protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+        if protocol_version is not None and protocol_version not in STREAMABLE_HTTP_PROTOCOL_VERSIONS:
             self.send_error(400, "Unsupported MCP-Protocol-Version")
             return
 
@@ -582,9 +603,12 @@ class McpServer:
         self._server_thread: threading.Thread | None = None
         self._running = False
         self._sse_connections: dict[str, _McpSseConnection] = {}
-        self._http_sessions: set[str] = set()
-        self._http_session_protocol_versions: dict[str, str] = {}
+        # Session state is LRU-bounded by max_http_sessions; evicted or DELETEd
+        # sessions get 404 and the client starts a new session per the MCP spec.
+        self._http_sessions: OrderedDict[str, None] = OrderedDict()
+        self._http_session_protocol_versions: OrderedDict[str, str] = OrderedDict()
         self._http_sessions_lock = threading.Lock()
+        self.max_http_sessions = 1024
         self._stdio_protocol_version: str | None = None
         self._pending_requests: dict[tuple[str | None, int | str], threading.Event] = {}
         self._pending_requests_lock = threading.Lock()
@@ -820,6 +844,8 @@ class McpServer:
                 transport_session_id="stdio:default",
             ):
                 response = await asyncio.to_thread(self._dispatch_mcp, request)
+            # Concurrent tasks race on this attribute, but initialize is the first
+            # request in practice and stale reads only see the default version.
             if request_method == "initialize" and response is not None and "error" not in response:
                 self._stdio_protocol_version = active_protocol_version
             await write_response(response)
@@ -874,25 +900,47 @@ class McpServer:
     def remember_http_session_protocol(self, session_id: str, protocol_version: str) -> None:
         with self._http_sessions_lock:
             self._http_session_protocol_versions[session_id] = protocol_version
+            self._http_session_protocol_versions.move_to_end(session_id)
+            self._evict_http_sessions()
 
     def get_http_session_protocol(self, session_id: str) -> str | None:
         with self._http_sessions_lock:
-            return self._http_session_protocol_versions.get(session_id)
+            protocol_version = self._http_session_protocol_versions.get(session_id)
+            if protocol_version is not None:
+                self._http_session_protocol_versions.move_to_end(session_id)
+            return protocol_version
 
     def register_http_session(self, session_id: str, protocol_version: str | None = None) -> None:
         with self._http_sessions_lock:
-            self._http_sessions.add(session_id)
+            self._http_sessions[session_id] = None
+            self._http_sessions.move_to_end(session_id)
             if protocol_version is not None:
                 self._http_session_protocol_versions[session_id] = protocol_version
+                self._http_session_protocol_versions.move_to_end(session_id)
+            self._evict_http_sessions()
 
     def has_http_session(self, session_id: str) -> bool:
         with self._http_sessions_lock:
-            return session_id in self._http_sessions
+            if session_id not in self._http_sessions:
+                return False
+            self._http_sessions.move_to_end(session_id)
+            return True
 
-    def unregister_http_session(self, session_id: str) -> None:
+    def unregister_http_session(self, session_id: str) -> bool:
+        """Terminate a session; returns whether the session was known."""
         with self._http_sessions_lock:
-            self._http_sessions.discard(session_id)
+            known = session_id in self._http_sessions or session_id in self._http_session_protocol_versions
+            self._http_sessions.pop(session_id, None)
             self._http_session_protocol_versions.pop(session_id, None)
+            return known
+
+    def _evict_http_sessions(self) -> None:
+        # Caller must hold _http_sessions_lock.
+        while len(self._http_sessions) > self.max_http_sessions:
+            evicted, _ = self._http_sessions.popitem(last=False)
+            self._http_session_protocol_versions.pop(evicted, None)
+        while len(self._http_session_protocol_versions) > self.max_http_sessions:
+            self._http_session_protocol_versions.popitem(last=False)
 
     def cors_localhost(self, origin: str) -> bool:
         """Allow CORS requests from localhost on ANY port."""
@@ -1040,6 +1088,7 @@ class McpServer:
         return self.context.protocol_version or MCP_PROTOCOL_VERSION
 
     def _protocol_at_least(self, version: str) -> bool:
+        # Protocol versions are ISO dates, so lexicographic order is chronological.
         return self._current_protocol_version() >= version
 
     def _tool_validation_errors_are_execution_errors(self) -> bool:

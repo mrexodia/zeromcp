@@ -1,6 +1,10 @@
 """Example MCP server with test tools"""
 
 import time
+import json
+import hmac
+import base64
+import hashlib
 import argparse
 from urllib.parse import urlparse
 from typing import Annotated, Optional, TypedDict, NotRequired
@@ -168,6 +172,36 @@ def infer_oauth_resource(transport: str) -> str:
     return f"{url.scheme}://{netloc}/mcp"
 
 
+def _b64url_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def verify_jwt_hs256(token: str, secret: bytes, audience: str) -> dict | None:
+    """Validate an HS256 JWT using only the standard library; returns its claims."""
+    try:
+        header_b64, payload_b64, signature_b64 = token.split(".")
+        header = json.loads(_b64url_decode(header_b64))
+        if header.get("alg") != "HS256":
+            return None
+        signature = hmac.new(secret, f"{header_b64}.{payload_b64}".encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(signature, _b64url_decode(signature_b64)):
+            return None
+        claims = json.loads(_b64url_decode(payload_b64))
+    except Exception:
+        return None
+
+    if not isinstance(claims, dict):
+        return None
+    now = time.time()
+    if "exp" in claims and now >= claims["exp"]:
+        return None
+    if "nbf" in claims and now < claims["nbf"]:
+        return None
+    if "aud" in claims and claims["aud"] != audience:
+        return None
+    return claims
+
+
 def configure_oauth(
     *,
     resource: str,
@@ -176,6 +210,7 @@ def configure_oauth(
     expected_token: str,
     subject: str,
     resource_metadata_url: str | None,
+    jwt_secret: str | None,
 ) -> None:
     @mcp.oauth(
         resource=resource,
@@ -185,7 +220,16 @@ def configure_oauth(
         resource_metadata_url=resource_metadata_url,
     )
     def verify_token(token: str, token_resource: str) -> McpAuthInfo | None:
-        if token != expected_token:
+        if jwt_secret is not None:
+            claims = verify_jwt_hs256(token, jwt_secret.encode(), token_resource)
+            if claims is None:
+                return None
+            return McpAuthInfo(
+                subject=claims.get("sub"),
+                scopes=frozenset(str(claims.get("scope", "")).split()),
+                claims=claims,
+            )
+        if not hmac.compare_digest(token.encode(), expected_token.encode()):
             return None
         return McpAuthInfo(
             subject=subject,
@@ -254,6 +298,10 @@ if __name__ == "__main__":
         "--oauth-resource-metadata-url",
         help="External OAuth Protected Resource Metadata URL to advertise in WWW-Authenticate.",
     )
+    parser.add_argument(
+        "--oauth-jwt-secret",
+        help="HS256 secret. When set, bearer tokens are validated as JWTs (sub/scope/exp/nbf/aud claims) instead of comparing against --oauth-token.",
+    )
     args = parser.parse_args()
     if args.transport == "stdio":
         if args.oauth:
@@ -281,6 +329,7 @@ if __name__ == "__main__":
                 expected_token=args.oauth_token,
                 subject=args.oauth_subject,
                 resource_metadata_url=args.oauth_resource_metadata_url,
+                jwt_secret=args.oauth_jwt_secret,
             )
 
         print("Starting MCP Example Server...")
@@ -291,7 +340,10 @@ if __name__ == "__main__":
             print(f"  resource: {oauth_resource}")
             print(f"  authorization servers: {oauth_authorization_servers}")
             print(f"  required scopes: {oauth_scopes}")
-            print(f"  local test token: {args.oauth_token}")
+            if args.oauth_jwt_secret:
+                print("  token validation: HS256 JWT")
+            else:
+                print(f"  local test token: {args.oauth_token}")
 
         print("\nAvailable tools:")
         for name in mcp.tools.methods.keys():
