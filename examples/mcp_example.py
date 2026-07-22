@@ -197,7 +197,14 @@ def verify_jwt_hs256(token: str, secret: bytes, audience: str) -> dict | None:
         return None
     if "nbf" in claims and now < claims["nbf"]:
         return None
-    if "aud" in claims and claims["aud"] != audience:
+    token_audience = claims.get("aud")
+    if isinstance(token_audience, str):
+        audience_matches = token_audience == audience
+    elif isinstance(token_audience, list):
+        audience_matches = all(isinstance(item, str) for item in token_audience) and audience in token_audience
+    else:
+        audience_matches = False
+    if not audience_matches:
         return None
     return claims
 

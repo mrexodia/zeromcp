@@ -455,12 +455,29 @@ async def exercise_serve_oauth_jwt():
         )
         assert forged.status_code == 401, "JWT with a wrong signature should be rejected"
 
+        multiple_audiences = requests.post(
+            resource,
+            headers={
+                "Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'aud': ['https://other.example', resource]})}"
+            },
+            json=whoami,
+        )
+        assert multiple_audiences.status_code == 200, "JWT audience arrays should be supported"
+
         wrong_audience = requests.post(
             resource,
             headers={"Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'aud': 'https://other.example'})}"},
             json=whoami,
         )
         assert wrong_audience.status_code == 401, "JWT for another resource should be rejected"
+
+        claims_without_audience = {name: value for name, value in claims.items() if name != "aud"}
+        missing_audience = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, claims_without_audience)}"},
+            json=whoami,
+        )
+        assert missing_audience.status_code == 401, "JWT without an audience should be rejected"
 
         missing_scope = requests.post(
             resource,
