@@ -519,11 +519,13 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
-        requested_protocol_version = None
+        requested_protocol_version: str | None = None
         if request_method == "initialize" and isinstance(parsed, dict):
             params = parsed.get("params")
-            if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
-                requested_protocol_version = params["protocolVersion"]
+            if isinstance(params, dict):
+                protocol_version_param = params.get("protocolVersion")
+                if isinstance(protocol_version_param, str):
+                    requested_protocol_version = protocol_version_param
 
         incoming_session_id = self.headers.get("Mcp-Session-Id")
         request_session_id = incoming_session_id
@@ -556,7 +558,11 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             return
 
         if request_method == "initialize":
-            active_protocol_version = requested_protocol_version if requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+            active_protocol_version = (
+                requested_protocol_version
+                if requested_protocol_version is not None and requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS
+                else MCP_PROTOCOL_VERSION
+            )
         else:
             active_protocol_version = protocol_version
             if active_protocol_version is None and incoming_session_id is not None:
@@ -887,11 +893,17 @@ class McpServer:
         if method != "initialize":
             return method if isinstance(method, str) else None, self._stdio_protocol_version or MCP_PROTOCOL_VERSION
 
-        requested_protocol_version = None
+        requested_protocol_version: str | None = None
         params = request.get("params")
-        if isinstance(params, dict) and isinstance(params.get("protocolVersion"), str):
-            requested_protocol_version = params["protocolVersion"]
-        active_protocol_version = requested_protocol_version if requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
+        if isinstance(params, dict):
+            protocol_version_param = params.get("protocolVersion")
+            if isinstance(protocol_version_param, str):
+                requested_protocol_version = protocol_version_param
+        active_protocol_version = (
+            requested_protocol_version
+            if requested_protocol_version is not None and requested_protocol_version in SUPPORTED_PROTOCOL_VERSIONS
+            else MCP_PROTOCOL_VERSION
+        )
         return method, active_protocol_version
 
     def get_current_transport_session_id(self) -> str | None:
