@@ -20,8 +20,13 @@ build-backend = "hatchling.build"
 dev = [
     "coverage>=7.11.3",
     "mcp>=1.21.2",
+    "pytest>=8.3.0",
     "requests>=2.32.5",
 ]
 
 [tool.coverage.report]
 omit = ["tests/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

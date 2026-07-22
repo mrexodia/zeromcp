@@ -1,9 +1,15 @@
 import os
 import sys
+import json
+import time
+import hmac
+import base64
 import socket
 import asyncio
+import hashlib
 import subprocess
 
+import requests
 from pydantic import AnyUrl
 from mcp import ClientSession, StdioServerParameters, McpError, types
 from mcp.client.stdio import stdio_client
@@ -13,7 +19,14 @@ from mcp.client.streamable_http import streamablehttp_client
 example_mcp = os.path.join(os.path.dirname(__file__), "..", "examples", "mcp_example.py")
 assert os.path.exists(example_mcp), f"not found: {example_mcp}"
 
-async def test_example_server(prefix: str, session: ClientSession):
+
+def local_source_env() -> dict[str, str]:
+    return {
+        **os.environ,
+        "PYTHONPATH": os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")),
+    }
+
+async def exercise_example_server(prefix: str, session: ClientSession):
     # Initialize the connection
     await session.initialize()
 
@@ -38,7 +51,16 @@ async def test_example_server(prefix: str, session: ClientSession):
     tools = await session.list_tools()
     print(f"[{prefix}] Available tools: {[t.name for t in tools.tools]}")
     tool_names = {t.name for t in tools.tools}
-    assert tool_names == {"divide", "greet", "random_dict", "get_system_info", "failing_tool", "struct_get"}, f"unexpected tools: {tool_names}"
+    assert tool_names == {
+        "divide",
+        "echo",
+        "slow_count",
+        "greet",
+        "random_dict",
+        "get_system_info",
+        "failing_tool",
+        "struct_get",
+    }, f"unexpected tools: {tool_names}"
 
     # List available prompts
     prompts = await session.list_prompts()
@@ -91,6 +113,12 @@ async def test_example_server(prefix: str, session: ClientSession):
     assert isinstance(result_unstructured, types.TextContent), "expected TextContent"
     print(f"[{prefix}] Divide result: {result_unstructured.text}")
     assert "21" in result_unstructured.text, "42/2 should be 21"
+
+    # Call echo tool
+    result = await session.call_tool("echo", arguments={"text": "hello \"world\"\nline2"})
+    assert not result.isError, "echo should succeed"
+    assert isinstance(result.content[0], types.TextContent), "expected TextContent"
+    assert result.content[0].text == "hello \"world\"\nline2", "expected exact text"
 
     # Call greet tool without age
     result = await session.call_tool("greet", arguments={"name": "Alice"})
@@ -154,19 +182,30 @@ async def test_example_server(prefix: str, session: ClientSession):
     result = await session.call_tool("random_dict", arguments={"param": None})
     assert not result.isError, "random_dict with null should succeed"
 
-async def test_edge_cases(prefix: str, session: ClientSession):
+async def exercise_edge_cases(prefix: str, session: ClientSession):
     """Test edge cases and error conditions"""
     await session.initialize()
 
-    # Test non-existent tool
-    result = await session.call_tool("nonexistent_tool", arguments={})
-    assert result.isError, "should error on non-existent tool"
-    print(f"[{prefix}] Non-existent tool error: {result.content[0] if result.content else 'no content'}")
+    # Test non-existent tool (protocol error)
+    try:
+        await session.call_tool("nonexistent_tool", arguments={})
+        assert False, "should have raised on non-existent tool"
+    except McpError as e:
+        assert "not found" in e.error.message, "expected method not found error"
+        print(f"[{prefix}] Non-existent tool error: {e.error.message}")
 
-    # Test missing required parameter
-    result = await session.call_tool("divide", arguments={"numerator": 42})
-    assert result.isError, "should error on missing denominator"
-    print(f"[{prefix}] Missing param error: {result.content[0] if result.content else 'no content'}")
+    # Test missing required parameter. 2025-11-25 reports tool input validation
+    # as a tool execution error; older versions report a protocol error.
+    try:
+        result = await session.call_tool("divide", arguments={"numerator": 42})
+        assert result.isError, "missing denominator should return a tool error"
+        content = result.content[0]
+        assert isinstance(content, types.TextContent), "expected TextContent"
+        assert "missing required" in content.text, "expected missing parameter error"
+        print(f"[{prefix}] Missing param tool error: {content.text}")
+    except McpError as e:
+        assert "missing required" in e.error.message, "expected missing parameter error"
+        print(f"[{prefix}] Missing param protocol error: {e.error.message}")
 
     # Test division by zero (natural exception)
     result = await session.call_tool("divide", arguments={"numerator": 1, "denominator": 0})
@@ -213,30 +252,31 @@ def coverage_wrap(name: str, args: list[str]) -> list[str]:
         args = ["-m", "coverage", "run", f"--data-file=.coverage.{name}"] + args
     return args
 
-async def test_stdio():
+async def exercise_stdio():
     print("[stdio] Testing...")
     server_params = StdioServerParameters(
         command=sys.executable,
         args=coverage_wrap("stdio", [example_mcp, "--transport", "stdio"]),
+        env=local_source_env(),
     )
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
-            await test_example_server("stdio", session)
-            await test_edge_cases("stdio", session)
+            await exercise_example_server("stdio", session)
+            await exercise_edge_cases("stdio", session)
 
-async def test_sse(address: str):
+async def exercise_sse(address: str):
     print("[sse] Testing...")
     async with sse_client(f"{address}/sse") as (read, write):
         async with ClientSession(read, write) as session:
-            await test_example_server("sse", session)
-            await test_edge_cases("sse", session)
+            await exercise_example_server("sse", session)
+            await exercise_edge_cases("sse", session)
 
-async def test_streamablehttp(address: str):
+async def exercise_streamablehttp(address: str):
     print("[streamable] Testing...")
     async with streamablehttp_client(f"{address}/mcp") as (read, write, session_callback):
         async with ClientSession(read, write) as session:
-            await test_example_server("streamable", session)
-            await test_edge_cases("streamable", session)
+            await exercise_example_server("streamable", session)
+            await exercise_edge_cases("streamable", session)
 
 def find_available_port():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -245,7 +285,7 @@ def find_available_port():
     sock.close()
     return port
 
-async def test_serve():
+async def exercise_serve():
     print("[serve] Testing...")
 
     # Start example MCP server as subprocess
@@ -256,20 +296,209 @@ async def test_serve():
         text=True,
         encoding="utf-8",
         bufsize=1,
+        env=local_source_env(),
     )
     try:
         await asyncio.sleep(0.5)  # Wait for server to start
-        await test_sse(address)
-        await test_streamablehttp(address)
+        await exercise_sse(address)
+        await exercise_streamablehttp(address)
     finally:
         print("[serve] Terminating example MCP server")
         process.stdin.close()  # type: ignore
         process.wait()
     pass
 
+async def exercise_serve_oauth():
+    print("[serve-oauth] Testing...")
+
+    address = f"http://127.0.0.1:{find_available_port()}"
+    token = "oauth-test-token"
+    process = subprocess.Popen(
+        [sys.executable]
+        + coverage_wrap(
+            "serve-oauth",
+            [
+                example_mcp,
+                "--transport",
+                address,
+                "--oauth",
+                "--oauth-token",
+                token,
+                "--oauth-resource",
+                f"{address}/mcp",
+                "--oauth-authorization-server",
+                "https://auth.example.com",
+                "--oauth-scope",
+                "mcp",
+            ],
+        ),
+        stdin=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+        env=local_source_env(),
+    )
+    try:
+        await asyncio.sleep(0.5)
+        metadata = requests.get(f"{address}/.well-known/oauth-protected-resource")
+        assert metadata.status_code == 200
+        assert metadata.json() == {
+            "resource": f"{address}/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+            "bearer_methods_supported": ["header"],
+            "scopes_supported": ["mcp"],
+        }
+
+        ping = {"jsonrpc": "2.0", "method": "ping", "id": 1}
+        unauthorized = requests.post(f"{address}/mcp", json=ping)
+        assert unauthorized.status_code == 401
+        assert "resource_metadata" in unauthorized.headers.get("WWW-Authenticate", "")
+
+        authorized = requests.post(
+            f"{address}/mcp",
+            headers={"Authorization": f"Bearer {token}"},
+            json=ping,
+        )
+        assert authorized.status_code == 200
+        assert authorized.json() == {"jsonrpc": "2.0", "result": {}, "id": 1}
+
+        whoami = requests.post(
+            f"{address}/mcp",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "MCP-Protocol-Version": "2025-06-18",
+            },
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "whoami", "arguments": {}},
+                "id": 2,
+            },
+        )
+        assert whoami.status_code == 200
+        assert whoami.json()["result"]["structuredContent"]["subject"] == "example-user"
+    finally:
+        print("[serve-oauth] Terminating example MCP server")
+        process.stdin.close()  # type: ignore
+        process.wait()
+
+def make_jwt_hs256(secret: bytes, claims: dict) -> str:
+    def b64url(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = b64url(json.dumps(claims).encode())
+    signature = b64url(hmac.new(secret, f"{header}.{payload}".encode(), hashlib.sha256).digest())
+    return f"{header}.{payload}.{signature}"
+
+
+async def exercise_serve_oauth_jwt():
+    print("[serve-oauth-jwt] Testing...")
+
+    address = f"http://127.0.0.1:{find_available_port()}"
+    resource = f"{address}/mcp"
+    secret = b"jwt-test-secret"
+    process = subprocess.Popen(
+        [sys.executable]
+        + coverage_wrap(
+            "serve-oauth-jwt",
+            [
+                example_mcp,
+                "--transport",
+                address,
+                "--oauth",
+                "--oauth-jwt-secret",
+                secret.decode(),
+                "--oauth-resource",
+                resource,
+                "--oauth-scope",
+                "mcp",
+            ],
+        ),
+        stdin=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        bufsize=1,
+        env=local_source_env(),
+    )
+    try:
+        await asyncio.sleep(0.5)
+        claims = {"sub": "jwt-user", "aud": resource, "scope": "mcp", "exp": time.time() + 60}
+
+        whoami = {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "whoami", "arguments": {}},
+            "id": 1,
+        }
+        authorized = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, claims)}"},
+            json=whoami,
+        )
+        assert authorized.status_code == 200
+        structured = authorized.json()["result"]["structuredContent"]
+        assert structured["subject"] == "jwt-user"
+        assert structured["claims"]["aud"] == resource
+
+        expired = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'exp': time.time() - 60})}"},
+            json=whoami,
+        )
+        assert expired.status_code == 401, "expired JWT should be rejected"
+
+        forged = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(b'wrong-secret', claims)}"},
+            json=whoami,
+        )
+        assert forged.status_code == 401, "JWT with a wrong signature should be rejected"
+
+        multiple_audiences = requests.post(
+            resource,
+            headers={
+                "Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'aud': ['https://other.example', resource]})}"
+            },
+            json=whoami,
+        )
+        assert multiple_audiences.status_code == 200, "JWT audience arrays should be supported"
+
+        wrong_audience = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'aud': 'https://other.example'})}"},
+            json=whoami,
+        )
+        assert wrong_audience.status_code == 401, "JWT for another resource should be rejected"
+
+        claims_without_audience = {name: value for name, value in claims.items() if name != "aud"}
+        missing_audience = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, claims_without_audience)}"},
+            json=whoami,
+        )
+        assert missing_audience.status_code == 401, "JWT without an audience should be rejected"
+
+        missing_scope = requests.post(
+            resource,
+            headers={"Authorization": f"Bearer {make_jwt_hs256(secret, {**claims, 'scope': 'other'})}"},
+            json=whoami,
+        )
+        assert missing_scope.status_code == 403, "JWT without the required scope should be rejected"
+    finally:
+        print("[serve-oauth-jwt] Terminating example MCP server")
+        process.stdin.close()  # type: ignore
+        process.wait()
+
+
 async def main():
-    await test_serve()
-    await test_stdio()
+    await exercise_serve()
+    await exercise_serve_oauth()
+    await exercise_serve_oauth_jwt()
+    await exercise_stdio()
+
+def test_mcp_transports():
+    asyncio.run(main())
 
 if __name__ == "__main__":
     import os
