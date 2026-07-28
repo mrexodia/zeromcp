@@ -14,12 +14,12 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
-from typing import Any, Callable, Union, Annotated, BinaryIO, Mapping, NotRequired, Required, get_origin, get_args, get_type_hints, is_typeddict
+from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, Mapping, NotRequired, Required, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
-from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse, _is_async_callable
+from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse, _is_async_callable, _literal_json_value
 
 # Deliberately not the newest supported version: older, half-compliant clients
 # are more likely to work when negotiation falls back to 2025-06-18.
@@ -1359,6 +1359,17 @@ class McpServer:
         # Required[T] / NotRequired[T]
         if origin in (Required, NotRequired):
             return self._type_to_json_schema(get_args(py_type)[0])
+
+        # Literal[value, ...]
+        if origin is Literal:
+            values = [_literal_json_value(value) for value in get_args(py_type)]
+            schema: dict[str, Any] = {"enum": values}
+            value_types = {type(value) for value in values}
+            if len(value_types) == 1:
+                value_schema = self._type_to_json_schema(next(iter(value_types)))
+                if value_schema.get("type") != "object":
+                    schema = {**value_schema, **schema}
+            return schema
 
         # Union[Ts..], Optional[T] and T1 | T2
         if origin in (Union, UnionType):

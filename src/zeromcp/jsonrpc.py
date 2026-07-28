@@ -3,8 +3,42 @@ import contextvars
 import inspect
 import json
 import traceback
-from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
+from typing import Any, Callable, Literal, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
+from enum import Enum
+
+
+def _literal_json_value(value: Any) -> str | int | float | bool | None:
+    """Return the JSON wire value represented by a Literal member."""
+    if isinstance(value, Enum):
+        value = value.value
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    raise TypeError(f"Literal member {value!r} is not representable in JSON")
+
+
+def _match_literal(value: Any, members: tuple[Any, ...]) -> tuple[bool, Any]:
+    for member in members:
+        wire_value = _literal_json_value(member)
+        if value == wire_value and type(value) is type(wire_value):
+            return True, member
+    return False, value
+
+
+def _match_json_null(py_type: Any) -> tuple[bool, Any]:
+    if py_type is type(None):
+        return True, None
+    origin = get_origin(py_type)
+    args = get_args(py_type)
+    if origin is Literal:
+        return _match_literal(None, args)
+    if origin in (Union, UnionType):
+        for arg in args:
+            matched, literal_value = _match_json_null(arg)
+            if matched:
+                return True, literal_value
+    return False, None
+
 
 
 def _is_async_callable(func: Callable | None) -> bool:
@@ -257,21 +291,41 @@ class JsonRpcRegistry:
 
                 # Handle None/null
                 if value is None:
-                    if expected_type is not type(None):
-                        # Check if None is allowed in a Union
-                        if not (origin in (Union, UnionType) and type(None) in args):
-                            raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
-                    validated_params[param_name] = None
+                    matched, literal_value = _match_json_null(expected_type)
+                    if not matched:
+                        raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
+                    validated_params[param_name] = literal_value
+                    continue
+
+                # Handle Literal values before generic origins. Enum members are
+                # represented by their JSON-compatible values on the wire.
+                if origin is Literal:
+                    matched, literal_value = _match_literal(value, args)
+                    if not matched:
+                        raise JsonRpcException(
+                            -32602,
+                            f"Invalid params: {param_name} expected one of {list(args)!r}, got {value!r}",
+                        )
+                    validated_params[param_name] = literal_value
                     continue
 
                 # Handle Union types (int | str, Optional[int], etc.)
                 if origin in (Union, UnionType):
                     type_matched = False
+                    validated_value = value
                     for arg_type in args:
                         if arg_type is type(None):
                             continue
 
                         arg_origin = get_origin(arg_type)
+                        if arg_origin is Literal:
+                            matched, literal_value = _match_literal(value, get_args(arg_type))
+                            if matched:
+                                type_matched = True
+                                validated_value = literal_value
+                                break
+                            continue
+
                         check_type = arg_origin if arg_origin is not None else arg_type
 
                         # TypedDict cannot be used with isinstance - check for dict instead
@@ -284,7 +338,7 @@ class JsonRpcRegistry:
 
                     if not type_matched:
                         raise JsonRpcException(-32602, f"Invalid params: {param_name} union does not contain {type(value).__name__}")
-                    validated_params[param_name] = value
+                    validated_params[param_name] = validated_value
                     continue
 
                 # Handle generic types (list[X], dict[K,V])

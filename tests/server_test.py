@@ -6,8 +6,9 @@ import sys
 import socket
 import zlib
 from contextlib import contextmanager
+from enum import Enum
 from types import SimpleNamespace
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, TypedDict, cast
 from zeromcp import McpAuthInfo, McpServer, McpHttpRequestHandler
 
 def find_free_port():
@@ -376,6 +377,60 @@ def test_tool_schema_includes_future_fields_for_all_versions():
             schema = server._dispatch_mcp(request)["result"]["tools"][0]
         assert schema["annotations"]["readOnlyHint"] is True
         assert schema["outputSchema"]["properties"]["result"]["type"] == "integer"
+    print("✓ PASS")
+
+
+def test_literal_fields_generate_json_schema_enums():
+    print("Testing Literal fields generate JSON Schema enums...")
+    server = McpServer("literal-schema-test")
+
+    class Backend(Enum):
+        GUI = "gui"
+        IDALIB = "idalib"
+
+    class Instance(TypedDict):
+        backend: Literal["gui", "idalib"]
+        status: Literal["available", "attached", "current", "unavailable"]
+
+    class Result(TypedDict):
+        instances: list[Instance]
+
+    @server.tool
+    def list_instances(backend: Literal[Backend.GUI, Backend.IDALIB] = Backend.GUI) -> Result:
+        assert isinstance(backend, Backend)
+        return {"instances": [{"backend": backend.value, "status": "available"}]}
+
+    response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert response is not None
+    json.dumps(response)
+    tool = response["result"]["tools"][0]
+    assert tool["inputSchema"]["properties"]["backend"] == {
+        "type": "string",
+        "enum": ["gui", "idalib"],
+    }
+    properties = tool["outputSchema"]["properties"]
+    instance_properties = properties["instances"]["items"]["properties"]
+    assert instance_properties["backend"] == {
+        "type": "string",
+        "enum": ["gui", "idalib"],
+    }
+    assert instance_properties["status"] == {
+        "type": "string",
+        "enum": ["available", "attached", "current", "unavailable"],
+    }
+
+    call_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "list_instances", "arguments": {"backend": "idalib"}},
+        "id": 2,
+    })
+    assert call_response is not None
+    assert call_response["result"]["structuredContent"]["instances"][0]["backend"] == "idalib"
     print("✓ PASS")
 
 
@@ -1268,6 +1323,7 @@ def run_all_tests():
         test_stdio_preserves_negotiated_protocol_version()
         test_protocol_specific_tool_argument_errors()
         test_tool_schema_includes_future_fields_for_all_versions()
+        test_literal_fields_generate_json_schema_enums()
         test_str_tool_result_is_unstructured_text()
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()
