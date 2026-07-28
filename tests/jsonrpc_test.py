@@ -6,7 +6,8 @@ import json
 import sys
 import traceback
 import re
-from typing import Optional, Any, TypedDict
+from enum import Enum
+from typing import Optional, Any, Literal, TypedDict
 
 from zeromcp.jsonrpc import JsonRpcRegistry
 
@@ -48,6 +49,29 @@ def union_test(id: int | str | None | Point) -> str:
 @jsonrpc.method
 def list_test(items: list[str]) -> int:
     return len(items)
+
+@jsonrpc.method
+def literal_test(mode: Literal["fast", "safe"]) -> str:
+    return mode
+
+@jsonrpc.method
+def literal_union_test(mode: Literal["auto"] | int) -> str:
+    return str(mode)
+
+@jsonrpc.method
+def nullable_literal_test(mode: Literal["auto", None]) -> str:
+    return repr(mode)
+
+@jsonrpc.method
+def nullable_literal_union_test(mode: Literal[None] | str) -> str:
+    return repr(mode)
+
+class NullMode(Enum):
+    NULL = None
+
+@jsonrpc.method
+def nullable_enum_literal_union_test(mode: Literal[NullMode.NULL] | str) -> str:
+    return mode.name if isinstance(mode, NullMode) else mode
 
 @jsonrpc.method
 def exception():
@@ -544,6 +568,55 @@ def run_all_tests():
         '{"jsonrpc": "2.0", "method": "list_test", "params": ["not a list"], "id": 1}',
         {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: items expected list, got str"}, "id": 1},
         "Generic type list[str] - wrong outer type"
+    )
+
+    # Literal - valid value
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "literal_test", "params": ["fast"], "id": 1}',
+        {"jsonrpc": "2.0", "result": "fast", "id": 1},
+        "Literal - valid value"
+    )
+
+    # Literal - invalid value
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "literal_test", "params": ["other"], "id": 1}',
+        {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32602,
+                "message": "Invalid params: mode expected one of ['fast', 'safe'], got 'other'",
+            },
+            "id": 1,
+        },
+        "Literal - invalid value"
+    )
+
+    # Literal nested in a union
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "literal_union_test", "params": ["auto"], "id": 1}',
+        {"jsonrpc": "2.0", "result": "auto", "id": 1},
+        "Literal union - literal value"
+    )
+
+    # Literal containing None accepts JSON null
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "nullable_literal_test", "params": [null], "id": 1}',
+        {"jsonrpc": "2.0", "result": "None", "id": 1},
+        "Literal - null member"
+    )
+
+    # A nested Literal union arm accepts JSON null
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "nullable_literal_union_test", "params": [null], "id": 1}',
+        {"jsonrpc": "2.0", "result": "None", "id": 1},
+        "Literal union - null member"
+    )
+
+    # An Enum Literal whose JSON wire value is null also accepts JSON null
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "nullable_enum_literal_union_test", "params": [null], "id": 1}',
+        {"jsonrpc": "2.0", "result": "NULL", "id": 1},
+        "Enum Literal union - null wire value"
     )
 
     # Point TypedDict - valid dict
