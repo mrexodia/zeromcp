@@ -57,6 +57,9 @@ jobs:
       - name: Test Server
         run: uv run coverage run --data-file=.coverage.server tests/server_test.py
 
+      - name: Test future annotations
+        run: uv run coverage run --data-file=.coverage.future-annotations tests/future_annotations_test.py
+
       - name: Generate coverage report
         run: |
           uv run coverage combine

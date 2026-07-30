@@ -14,7 +14,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
-from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, Mapping, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
+from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, Mapping, NotRequired, Required, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
@@ -1356,8 +1356,8 @@ class McpServer:
                 "description": str(args[-1]),
             }
 
-        # NotRequired[T]
-        if origin is NotRequired:
+        # Required[T] / NotRequired[T]
+        if origin in (Required, NotRequired):
             return self._type_to_json_schema(get_args(py_type)[0])
 
         # Literal[value, ...]
@@ -1406,10 +1406,57 @@ class McpServer:
             }.get(py_type, "object"),
         }
 
+    @staticmethod
+    def _typeddict_field_qualifiers(annotation: Any) -> set:
+        """Resolve Required[...]/NotRequired[...] wrappers on an already-evaluated annotation.
+
+        Only meaningful once forward refs are resolved (e.g. via get_type_hints) - on a
+        TypedDict class body, `Required`/`NotRequired` detection happens on the raw
+        annotation at class-creation time, so it silently misses these wrappers when the
+        defining module has `from __future__ import annotations` (the annotation is a bare
+        string/ForwardRef at that point, not the real generic alias).
+        """
+        qualifiers = set()
+        while True:
+            origin = get_origin(annotation)
+            if origin is Annotated:
+                args = get_args(annotation)
+                if not args:
+                    break
+                annotation = args[0]
+            elif origin is Required:
+                qualifiers.add(Required)
+                (annotation,) = get_args(annotation)
+            elif origin is NotRequired:
+                qualifiers.add(NotRequired)
+                (annotation,) = get_args(annotation)
+            else:
+                break
+        return qualifiers
+
     def _typed_dict_to_schema(self, typed_dict_class) -> dict:
         """Convert TypedDict to JSON schema"""
         hints = get_type_hints(typed_dict_class, include_extras=True)
-        required_keys = getattr(typed_dict_class, "__required_keys__", set(hints.keys()))
+        required_keys = set(getattr(typed_dict_class, "__required_keys__", set(hints.keys())))
+        optional_keys = set(getattr(typed_dict_class, "__optional_keys__", set()))
+
+        # `__required_keys__`/`__optional_keys__` are computed by Python's TypedDict
+        # metaclass at class-creation time by inspecting each field's raw annotation
+        # for a Required[...]/NotRequired[...] wrapper. Under `from __future__ import
+        # annotations`, that raw annotation is an unevaluated string/ForwardRef, so the
+        # metaclass can't see the wrapper and silently falls back to the class's `total`
+        # default. A field with no explicit wrapper is unaffected either way (there's
+        # nothing to detect, so the `total` fallback the metaclass already applied is
+        # correct) - so overriding only fields with an explicit, fully-resolved wrapper
+        # here corrects the class's own (possibly wrong) computation unconditionally.
+        for field_name, field_type in hints.items():
+            qualifiers = self._typeddict_field_qualifiers(field_type)
+            if Required in qualifiers:
+                required_keys.add(field_name)
+                optional_keys.discard(field_name)
+            elif NotRequired in qualifiers:
+                optional_keys.add(field_name)
+                required_keys.discard(field_name)
 
         return {
             "type": "object",
