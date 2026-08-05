@@ -6,6 +6,13 @@ import traceback
 from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
 from types import UnionType
 
+
+def _is_async_callable(func: Callable | None) -> bool:
+    """Return whether invoking the callable directly creates a coroutine."""
+    if func is None:
+        return False
+    return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(getattr(func, "__call__", None))
+
 JsonRpcId: TypeAlias = str | int | None
 JsonRpcParams: TypeAlias = dict[str, Any] | list[Any] | None
 
@@ -96,7 +103,11 @@ class JsonRpcRegistry:
         request_token = self._current_request.set(request_id)
         async_token = self._async_dispatch.set(True)
         try:
-            result = self._call(method, params)
+            func = self.methods.get(method)
+            if _is_async_callable(func):
+                result = self._call(method, params)
+            else:
+                result = await asyncio.to_thread(self._call, method, params)
             if inspect.isawaitable(result):
                 result = await result
             if is_notification:

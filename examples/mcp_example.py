@@ -1,5 +1,6 @@
 """Example MCP server with test tools"""
 
+import asyncio
 import time
 import json
 import hmac
@@ -70,11 +71,9 @@ def echo(text: Annotated[str, "Text to echo verbatim"]) -> str:
 
 
 @mcp.tool(read_only=True, destructive=False, idempotent=False, open_world=False)
-def slow_count(limit: Annotated[int, "How high to count"] = 10) -> str:
-    """Long-running tool that supports cancellation"""
-    for _ in range(limit):
-        mcp.check_cancelled()
-        time.sleep(1)
+async def slow_count(limit: Annotated[int, "How high to count"] = 10) -> str:
+    """Long-running async tool that supports cancellation"""
+    await asyncio.sleep(limit)
     return f"Counted to {limit}"
 
 

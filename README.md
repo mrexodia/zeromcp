@@ -250,16 +250,39 @@ async def slow_lookup(key: str) -> str:
 
 ## Cancellation
 
-Long-running tools, resources, and prompts can poll `mcp.check_cancelled()` to honor `notifications/cancelled`. When the client cancels, the call is abandoned without a JSON-RPC response, as the spec requires:
+Cancellation is supported for async tools, resources, and prompts. ZeroMCP
+runs each async request as an `asyncio.Task`; `notifications/cancelled` calls
+`Task.cancel(reason)`, so the handler receives `asyncio.CancelledError` at its
+next await point. A cancelled call produces no JSON-RPC response, even if the
+handler suppresses the exception and returns a value.
 
 ```python
 @mcp.tool
-def slow_count(limit: int = 10) -> str:
-    for _ in range(limit):
-        mcp.check_cancelled()
-        time.sleep(1)
-    return f"Counted to {limit}"
+async def remote_operation() -> str:
+    operation = asyncio.create_task(start_remote_operation())
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        await cancel_remote_operation()
+        try:
+            await asyncio.shield(operation)  # wait for safe remote unwinding
+        except Exception:
+            pass
+        raise
 ```
+
+Synchronous handlers are not cancellable. Cancelling an asyncio task cannot
+stop a running Python thread or native function safely, so ZeroMCP ignores
+cancellation notifications for synchronous handlers rather than pretending to
+terminate them. Cancellation follows the callable registered with ZeroMCP: a
+synchronous decorator makes a handler synchronous even if it returns a
+coroutine. Use an `async def` wrapper to preserve cancellation support.
+
+The transport must also be able to receive the cancellation notification while
+the original request is running. Use `await mcp.stdio_async()` for stdio;
+`mcp.stdio()` processes one message at a time and therefore cannot receive a
+cancellation until after the active request returns. Streamable HTTP and SSE
+can receive cancellation concurrently for async handlers.
 
 Cancellations are matched per transport session. Over Streamable HTTP the cancellation notification arrives as a separate POST, so the client must echo the `Mcp-Session-Id` header from `initialize` (the spec requires clients to do this). Requests from clients that omit the header cannot be correlated — JSON-RPC ids are only unique within a session, so matching bare ids would let one client cancel another's request — and such cancellations are ignored, which the spec permits.
 
