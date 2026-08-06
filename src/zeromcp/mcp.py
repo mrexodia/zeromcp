@@ -30,11 +30,16 @@ def _json_wire_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         result = {}
         for key, item in value.items():
+            original_key = key
             if isinstance(key, Enum):
                 wire_key = _literal_json_value(key)
                 if wire_key is not None and type(wire_key) not in (str, int, float, bool):
                     raise TypeError(f"Enum mapping key {key!r} has a non-scalar JSON value")
                 key = wire_key
+            if key in result:
+                raise TypeError(
+                    f"Mapping key {original_key!r} normalizes to duplicate JSON key {key!r}"
+                )
             result[key] = _json_wire_value(item)
         return result
     if isinstance(value, (list, tuple)):

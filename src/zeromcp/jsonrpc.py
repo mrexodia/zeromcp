@@ -23,6 +23,10 @@ def _literal_json_value(value: Any) -> Any:
             wire_key = _literal_json_value(key) if isinstance(key, Enum) else key
             if type(wire_key) is not str:
                 raise TypeError(f"Literal mapping key {key!r} is not representable in JSON")
+            if wire_key in result:
+                raise TypeError(
+                    f"Literal mapping key {key!r} normalizes to duplicate JSON key {wire_key!r}"
+                )
             result[wire_key] = _literal_json_value(item)
         return result
     raise TypeError(f"Literal member {value!r} is not representable in JSON")

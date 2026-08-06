@@ -519,6 +519,45 @@ def test_enum_mapping_keys_are_serialized():
     print("✓ PASS")
 
 
+def test_enum_mapping_key_collisions_are_rejected():
+    print("Testing collisions between Enum and wire mapping keys are rejected...")
+    server = McpServer("enum-mapping-key-collision-test")
+
+    class Key(Enum):
+        NAME = "name"
+
+    class Choice(Enum):
+        DUPLICATE = {Key.NAME: 1, "name": 2}
+
+    @server.tool
+    def choose(value: Literal[Choice.DUPLICATE]) -> str:
+        return "unreachable"
+
+    list_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert list_response is not None
+    assert list_response["error"]["code"] == -32603
+    assert "normalizes to duplicate JSON key 'name'" in list_response["error"]["message"]
+
+    @server.tool
+    def duplicate_result() -> dict:
+        return {Key.NAME: 1, "name": 2}
+
+    call_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "duplicate_result", "arguments": {}},
+        "id": 2,
+    })
+    assert call_response is not None
+    assert call_response["error"]["code"] == -32603
+    assert "normalizes to duplicate JSON key 'name'" in call_response["error"]["message"]
+    print("✓ PASS")
+
+
 def test_str_tool_result_is_unstructured_text():
     print("Testing string tool results are unstructured text...")
     server = McpServer("text-test")
@@ -1411,6 +1450,7 @@ def run_all_tests():
         test_literal_fields_generate_json_schema_enums()
         test_enum_literal_container_values()
         test_enum_mapping_keys_are_serialized()
+        test_enum_mapping_key_collisions_are_rejected()
         test_str_tool_result_is_unstructured_text()
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()
