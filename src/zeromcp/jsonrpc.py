@@ -3,28 +3,60 @@ import contextvars
 import inspect
 import json
 import traceback
+from collections.abc import Mapping
 from typing import Annotated, Any, Callable, Literal, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, Required, is_typeddict
 from types import UnionType
 from enum import Enum
 
 
-def _literal_json_value(value: Any) -> str | int | float | bool | None:
-    """Return the JSON wire value represented by a Literal member."""
+def _literal_json_value(value: Any) -> Any:
+    """Return the recursively normalized JSON wire value of a Literal member."""
     if isinstance(value, Enum):
-        value = value.value
+        return _literal_json_value(value.value)
     if value is None or type(value) in (str, int, float, bool):
         return value
+    if isinstance(value, (list, tuple)):
+        return [_literal_json_value(item) for item in value]
+    if isinstance(value, Mapping):
+        result = {}
+        for key, item in value.items():
+            wire_key = _literal_json_value(key) if isinstance(key, Enum) else key
+            if type(wire_key) is not str:
+                raise TypeError(f"Literal mapping key {key!r} is not representable in JSON")
+            result[wire_key] = _literal_json_value(item)
+        return result
     raise TypeError(f"Literal member {value!r} is not representable in JSON")
+
+
+def _json_values_equal(value: Any, wire_value: Any, *, numeric_equivalence: bool) -> bool:
+    value_is_number = type(value) in (int, float)
+    wire_value_is_number = type(wire_value) in (int, float)
+    if value_is_number or wire_value_is_number:
+        return (
+            value_is_number
+            and wire_value_is_number
+            and (numeric_equivalence or type(value) is type(wire_value))
+            and value == wire_value
+        )
+    if type(value) is not type(wire_value):
+        return False
+    if isinstance(value, list):
+        return len(value) == len(wire_value) and all(
+            _json_values_equal(item, wire_item, numeric_equivalence=numeric_equivalence)
+            for item, wire_item in zip(value, wire_value)
+        )
+    if isinstance(value, dict):
+        return value.keys() == wire_value.keys() and all(
+            _json_values_equal(value[key], wire_value[key], numeric_equivalence=numeric_equivalence)
+            for key in value
+        )
+    return value == wire_value
 
 
 def _match_literal(value: Any, members: tuple[Any, ...]) -> tuple[bool, Any]:
     for member in members:
         wire_value = _literal_json_value(member)
-        value_is_number = type(value) in (int, float)
-        wire_value_is_number = type(wire_value) in (int, float)
-        if value == wire_value and (
-            type(value) is type(wire_value) or (value_is_number and wire_value_is_number)
-        ):
+        if _json_values_equal(value, wire_value, numeric_equivalence=True):
             return True, member
     return False, value
 
@@ -227,11 +259,14 @@ class JsonRpcRegistry:
         if origin in (Annotated, Required, NotRequired):
             return self._is_exact_union_match(value, args[0])
         if origin is Literal:
-            for member in args:
-                wire_value = _literal_json_value(member)
-                if value == wire_value and type(value) is type(wire_value):
-                    return True
-            return False
+            return any(
+                _json_values_equal(
+                    value,
+                    _literal_json_value(member),
+                    numeric_equivalence=False,
+                )
+                for member in args
+            )
         if origin in (Union, UnionType):
             return any(self._is_exact_union_match(value, arg_type) for arg_type in args)
         if is_typeddict(expected_type):

@@ -436,6 +436,89 @@ def test_literal_fields_generate_json_schema_enums():
     print("✓ PASS")
 
 
+def test_enum_literal_container_values():
+    print("Testing container-valued Enum Literals...")
+    server = McpServer("literal-container-test")
+
+    class Token(Enum):
+        X = "x"
+
+    class Choice(Enum):
+        ITEMS = [Token.X, 1]
+        OPTIONS = {"token": Token.X, "counts": [1, 2.0]}
+
+    @server.tool
+    def choose(
+        items: Literal[Choice.ITEMS],
+        options: Literal[Choice.OPTIONS],
+    ) -> str:
+        assert items is Choice.ITEMS
+        assert options is Choice.OPTIONS
+        return "ok"
+
+    list_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert list_response is not None
+    json.dumps(list_response)
+    properties = list_response["result"]["tools"][0]["inputSchema"]["properties"]
+    assert properties["items"] == {
+        "type": "array",
+        "enum": [["x", 1]],
+    }
+    assert properties["options"] == {
+        "type": "object",
+        "enum": [{"token": "x", "counts": [1, 2.0]}],
+    }
+
+    call_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "choose",
+            "arguments": {
+                "items": ["x", 1.0],
+                "options": {"token": "x", "counts": [1.0, 2]},
+            },
+        },
+        "id": 2,
+    })
+    assert call_response is not None
+    assert call_response["result"]["content"][0]["text"] == "ok"
+    print("✓ PASS")
+
+
+def test_enum_mapping_keys_are_serialized():
+    print("Testing Enum mapping keys are serialized to their wire values...")
+    server = McpServer("enum-mapping-key-test")
+
+    class Key(Enum):
+        NAME = "name"
+
+    @server.tool
+    def echo(values: dict[Literal[Key.NAME], str]) -> dict[Literal[Key.NAME], str]:
+        assert values == {Key.NAME: "value"}
+        return values
+
+    response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "echo",
+            "arguments": {"values": {"name": "value"}},
+        },
+        "id": 1,
+    })
+    assert response is not None
+    json.dumps(response)
+    result = response["result"]
+    assert result["structuredContent"] == {"name": "value"}
+    assert json.loads(result["content"][0]["text"]) == {"name": "value"}
+    print("✓ PASS")
+
+
 def test_str_tool_result_is_unstructured_text():
     print("Testing string tool results are unstructured text...")
     server = McpServer("text-test")
@@ -1326,6 +1409,8 @@ def run_all_tests():
         test_protocol_specific_tool_argument_errors()
         test_tool_schema_includes_future_fields_for_all_versions()
         test_literal_fields_generate_json_schema_enums()
+        test_enum_literal_container_values()
+        test_enum_mapping_keys_are_serialized()
         test_str_tool_result_is_unstructured_text()
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()

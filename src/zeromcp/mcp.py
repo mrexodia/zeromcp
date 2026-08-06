@@ -24,11 +24,19 @@ from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoR
 
 
 def _json_wire_value(value: Any) -> Any:
-    """Recursively replace Enum members with their JSON wire values."""
+    """Recursively replace Enum members, including mapping keys, with wire values."""
     if isinstance(value, Enum):
         return _literal_json_value(value)
     if isinstance(value, Mapping):
-        return {key: _json_wire_value(item) for key, item in value.items()}
+        result = {}
+        for key, item in value.items():
+            if isinstance(key, Enum):
+                wire_key = _literal_json_value(key)
+                if wire_key is not None and type(wire_key) not in (str, int, float, bool):
+                    raise TypeError(f"Enum mapping key {key!r} has a non-scalar JSON value")
+                key = wire_key
+            result[key] = _json_wire_value(item)
+        return result
     if isinstance(value, (list, tuple)):
         return [_json_wire_value(item) for item in value]
     return value
@@ -1380,8 +1388,7 @@ class McpServer:
             value_types = {type(value) for value in values}
             if len(value_types) == 1:
                 value_schema = self._type_to_json_schema(next(iter(value_types)))
-                if value_schema.get("type") != "object":
-                    schema = {**value_schema, **schema}
+                schema = {**value_schema, **schema}
             return schema
 
         # Union[Ts..], Optional[T] and T1 | T2
