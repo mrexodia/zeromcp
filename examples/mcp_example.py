@@ -8,7 +8,7 @@ import base64
 import hashlib
 import argparse
 from urllib.parse import urlparse
-from typing import Annotated, Optional, TypedDict, NotRequired
+from typing import Annotated, Any, Optional, TypedDict, NotRequired
 from zeromcp import McpToolError, McpServer, McpAuthInfo
 
 mcp = McpServer("example")
@@ -108,7 +108,7 @@ def struct_get(
 
 
 @mcp.tool
-def random_dict(param: dict[str, int] | None) -> dict:
+def random_dict(param: dict[str, Any] | None) -> dict:
     """Return a random dictionary for testing serialization"""
     return {
         **(param or {}),

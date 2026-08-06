@@ -47,6 +47,10 @@ def union_test(id: int | str | None | Point) -> str:
     return f"ID: {id or '<nil>'}"
 
 @jsonrpc.method
+def exact_union_test(value: float | bool | int) -> str:
+    return f"{type(value).__name__}:{value!r}"
+
+@jsonrpc.method
 def list_test(items: list[str]) -> int:
     return len(items)
 
@@ -72,6 +76,28 @@ class NullMode(Enum):
 @jsonrpc.method
 def nullable_enum_literal_union_test(mode: Literal[NullMode.NULL] | str) -> str:
     return mode.name if isinstance(mode, NullMode) else mode
+
+class Ratio(Enum):
+    ONE = 1.0
+
+@jsonrpc.method
+def numeric_enum_literal_test(ratio: Literal[Ratio.ONE]) -> str:
+    return ratio.name
+
+class BackendMode(Enum):
+    GUI = "gui"
+
+class NestedLiteralOptions(TypedDict):
+    backend: Literal[BackendMode.GUI]
+    fallbacks: list[Literal[BackendMode.GUI]]
+    aliases: dict[str, Literal[BackendMode.GUI]]
+
+@jsonrpc.method
+def nested_literal_test(options: NestedLiteralOptions) -> str:
+    assert options["backend"] is BackendMode.GUI
+    assert options["fallbacks"] == [BackendMode.GUI]
+    assert options["aliases"] == {"default": BackendMode.GUI}
+    return "ok"
 
 @jsonrpc.method
 def exception():
@@ -534,6 +560,18 @@ def run_all_tests():
         "Union type (int | str | None) - null value"
     )
 
+    # Exact union arms take precedence over int-to-float coercion
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "exact_union_test", "params": [true], "id": 1}',
+        {"jsonrpc": "2.0", "result": "bool:True", "id": 1},
+        "Union type - exact bool before float coercion"
+    )
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "exact_union_test", "params": [1], "id": 1}',
+        {"jsonrpc": "2.0", "result": "int:1", "id": 1},
+        "Union type - exact int before float coercion"
+    )
+
     # ========================================
     # OPTIONAL TYPE TESTS
     # ========================================
@@ -560,7 +598,7 @@ def run_all_tests():
     check_rpc(
         '{"jsonrpc": "2.0", "method": "list_test", "params": [["a", "b", "c"]], "id": 1}',
         {"jsonrpc": "2.0", "result": 3, "id": 1},
-        "Generic type list[str] - valid list (no inner validation)"
+        "Generic type list[str] - valid list"
     )
 
     # list[T] - wrong outer type
@@ -617,6 +655,48 @@ def run_all_tests():
         '{"jsonrpc": "2.0", "method": "nullable_enum_literal_union_test", "params": [null], "id": 1}',
         {"jsonrpc": "2.0", "result": "NULL", "id": 1},
         "Enum Literal union - null wire value"
+    )
+
+    # JSON integers and floats use the same numeric equality semantics
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "numeric_enum_literal_test", "params": [1], "id": 1}',
+        {"jsonrpc": "2.0", "result": "ONE", "id": 1},
+        "Enum Literal - equivalent JSON number"
+    )
+
+    # JSON booleans remain distinct from numbers
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "numeric_enum_literal_test", "params": [true], "id": 1}',
+        {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32602,
+                "message": "Invalid params: ratio expected one of [<Ratio.ONE: 1.0>], got True",
+            },
+            "id": 1,
+        },
+        "Enum Literal - boolean is not a number"
+    )
+
+    # Literal enum values are converted recursively inside containers
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "nested_literal_test", "params": [{"backend": "gui", "fallbacks": ["gui"], "aliases": {"default": "gui"}}], "id": 1}',
+        {"jsonrpc": "2.0", "result": "ok", "id": 1},
+        "Enum Literal - nested container conversion"
+    )
+
+    # Schema-invalid nested Literal values are rejected
+    check_rpc(
+        '{"jsonrpc": "2.0", "method": "nested_literal_test", "params": [{"backend": "other", "fallbacks": [], "aliases": {}}], "id": 1}',
+        {
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32602,
+                "message": "Invalid params: options.backend expected one of [<BackendMode.GUI: 'gui'>], got 'other'",
+            },
+            "id": 1,
+        },
+        "Enum Literal - reject invalid nested value"
     )
 
     # Point TypedDict - valid dict

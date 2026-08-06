@@ -13,6 +13,7 @@ import contextvars
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, Mapping, NotRequired, Required, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
@@ -20,6 +21,18 @@ from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse, _is_async_callable, _literal_json_value
+
+
+def _json_wire_value(value: Any) -> Any:
+    """Recursively replace Enum members with their JSON wire values."""
+    if isinstance(value, Enum):
+        return _literal_json_value(value)
+    if isinstance(value, Mapping):
+        return {key: _json_wire_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_wire_value(item) for item in value]
+    return value
+
 
 # Deliberately not the newest supported version: older, half-compliant clients
 # are more likely to work when negotiation falls back to 2025-06-18.
@@ -1140,7 +1153,7 @@ class McpServer:
                 "isError": True,
             }
 
-        result = tool_response.get("result")
+        result = _json_wire_value(tool_response.get("result"))
         content = result if isinstance(result, str) else json.dumps(result, indent=2)
         mcp_result = {
             "content": [{"type": "text", "text": content}],
