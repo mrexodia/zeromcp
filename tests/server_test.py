@@ -596,26 +596,22 @@ def test_list_cursor_params_are_accepted():
 
 def test_resource_and_prompt_cancellation():
     print("Testing resource and prompt cancellation...")
+    import asyncio
     import threading
-    import time
 
     server = McpServer("cancel-non-tool-test")
     resource_started = threading.Event()
     prompt_started = threading.Event()
 
     @server.resource("example://slow")
-    def slow_resource():
+    async def slow_resource():
         resource_started.set()
-        while True:
-            server.check_cancelled()
-            time.sleep(0.01)
+        await asyncio.Event().wait()
 
     @server.prompt
-    def slow_prompt():
+    async def slow_prompt():
         prompt_started.set()
-        while True:
-            server.check_cancelled()
-            time.sleep(0.01)
+        await asyncio.Event().wait()
 
     def run_and_cancel(request: dict, started: threading.Event):
         result = {}
@@ -656,17 +652,14 @@ def test_stdio_async_cancellation():
     print("Testing async stdio cancellation...")
     import asyncio
     import threading
-    import time
 
     server = McpServer("stdio-cancel-test")
     started = threading.Event()
 
     @server.tool
-    def slow_tool():
+    async def slow_tool():
         started.set()
-        while True:
-            server.check_cancelled()
-            time.sleep(0.01)
+        await asyncio.Event().wait()
 
     call = json.dumps({
         "jsonrpc": "2.0",
@@ -699,21 +692,208 @@ def test_stdio_async_cancellation():
     print("✓ PASS")
 
 
-def test_cancelled_helper():
-    print("Testing cancellation helper...")
+def test_sync_tool_cancellation_is_ignored():
+    print("Testing synchronous tool cancellation is ignored...")
     import threading
-    import time
+
+    server = McpServer("sync-cancel-test")
+    started = threading.Event()
+    release = threading.Event()
+    result = {}
+
+    @server.tool
+    def slow_tool():
+        started.set()
+        assert release.wait(2)
+        return "done"
+
+    def call_tool():
+        result["response"] = server._dispatch_mcp({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "slow_tool", "arguments": {}},
+            "id": "sync-tool",
+        })
+
+    thread = threading.Thread(target=call_tool, daemon=True)
+    thread.start()
+    assert started.wait(2), "sync tool should have started"
+    server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": "sync-tool", "reason": "ignored"},
+    })
+    assert thread.is_alive(), "sync tool must not be interrupted"
+    release.set()
+    thread.join(2)
+
+    assert result["response"]["result"]["isError"] is False
+    print("✓ PASS")
+
+
+def test_async_tool_controls_cancellation_cleanup():
+    print("Testing async tool cancellation cleanup...")
+    import asyncio
+    import threading
+
+    server = McpServer("async-cancel-test")
+    started = threading.Event()
+    observed = {}
+    result = {}
+
+    @server.tool
+    async def slow_tool():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as error:
+            observed["reason"] = error.args[0]
+            observed["cleanup"] = True
+            raise
+
+    def call_tool():
+        result["response"] = server._dispatch_mcp({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "slow_tool", "arguments": {}},
+            "id": "async-tool",
+        })
+
+    thread = threading.Thread(target=call_tool, daemon=True)
+    thread.start()
+    assert started.wait(2), "async tool should have started"
+
+    server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": "async-tool", "reason": "client timeout"},
+    })
+    thread.join(2)
+
+    assert not thread.is_alive(), "async tool should stop after cancellation"
+    assert result["response"] is None
+    assert observed == {"reason": "client timeout", "cleanup": True}
+    print("✓ PASS")
+
+
+def test_sync_wrapper_around_async_tool_stays_synchronous():
+    print("Testing a synchronous wrapper around an async tool...")
+    import asyncio
+    from functools import wraps
+
+    server = McpServer("sync-wrapped-async-test")
+
+    def async_to_sync(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            return asyncio.run(func(*args, **kwargs))
+        return wrapped
+
+    @server.tool
+    @async_to_sync
+    async def wrapped_tool():
+        await asyncio.sleep(0)
+        return "done"
+
+    response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "wrapped_tool", "arguments": {}},
+        "id": "wrapped-async-tool",
+    })
+
+    assert response is not None
+    assert response["result"]["content"][0]["text"] == "done"
+    print("✓ PASS")
+
+
+def test_suppressed_async_cancellation_still_has_no_response():
+    print("Testing suppressed async cancellation response handling...")
+    import asyncio
+    import threading
+
+    server = McpServer("suppressed-cancel-test")
+    started = threading.Event()
+    result = {}
+
+    @server.tool
+    async def slow_tool():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return "suppressed"
+
+    def call_tool():
+        result["response"] = server._dispatch_mcp({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "slow_tool", "arguments": {}},
+            "id": "suppressed",
+        })
+
+    thread = threading.Thread(target=call_tool, daemon=True)
+    thread.start()
+    assert started.wait(2), "async tool should have started"
+    server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": {"requestId": "suppressed"},
+    })
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert result["response"] is None
+    print("✓ PASS")
+
+
+def test_non_client_task_cancellation_propagates():
+    print("Testing non-client task cancellation propagation...")
+    import asyncio
+
+    server = McpServer("owner-cancel-test")
+
+    async def scenario():
+        started = asyncio.Event()
+
+        @server.tool
+        async def slow_tool():
+            started.set()
+            await asyncio.Event().wait()
+
+        request_task = asyncio.create_task(server._dispatch_mcp_async({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "slow_tool", "arguments": {}},
+            "id": "owner-cancelled",
+        }))
+        await started.wait()
+        request_task.cancel("server shutdown")
+        try:
+            await request_task
+        except asyncio.CancelledError as error:
+            assert error.args == ("server shutdown",)
+        else:
+            raise AssertionError("non-client cancellation should propagate")
+
+    asyncio.run(scenario())
+    assert not server._pending_requests
+    print("✓ PASS")
+
+
+def test_cancelled_async_tool_has_no_response():
+    print("Testing cancelled async tool response suppression...")
+    import asyncio
+    import threading
 
     server = McpServer("cancel-test")
     started = threading.Event()
     result = {}
 
     @server.tool
-    def slow_tool():
+    async def slow_tool():
         started.set()
-        while True:
-            server.check_cancelled()
-            time.sleep(0.01)
+        await asyncio.Event().wait()
 
     def call_tool():
         result["response"] = server._dispatch_mcp({
@@ -752,8 +932,7 @@ def test_anonymous_http_cancellation_is_isolated():
         @server.tool
         def slow_tool() -> str:
             started.set()
-            while not release.wait(0.01):
-                server.check_cancelled()
+            release.wait(2)
             return "done"
 
         def call_tool():
@@ -1097,7 +1276,12 @@ def run_all_tests():
         test_list_cursor_params_are_accepted()
         test_resource_and_prompt_cancellation()
         test_stdio_async_cancellation()
-        test_cancelled_helper()
+        test_sync_tool_cancellation_is_ignored()
+        test_async_tool_controls_cancellation_cleanup()
+        test_sync_wrapper_around_async_tool_stays_synchronous()
+        test_suppressed_async_cancellation_still_has_no_response()
+        test_non_client_task_cancellation_propagates()
+        test_cancelled_async_tool_has_no_response()
         test_anonymous_http_cancellation_is_isolated()
         test_cors_permissive()
         test_cors_restrictive()

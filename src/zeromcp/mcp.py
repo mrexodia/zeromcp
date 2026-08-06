@@ -11,7 +11,7 @@ import traceback
 import asyncio
 import contextvars
 from collections import OrderedDict
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
 from typing import Any, Callable, Union, Annotated, BinaryIO, Mapping, NotRequired, get_origin, get_args, get_type_hints, is_typeddict
@@ -19,7 +19,7 @@ from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
-from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse
+from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse, _is_async_callable
 
 # Deliberately not the newest supported version: older, half-compliant clients
 # are more likely to work when negotiation falls back to 2025-06-18.
@@ -34,6 +34,25 @@ class McpAuthInfo:
     subject: str | None = None
     scopes: frozenset[str] = field(default_factory=frozenset)
     claims: Mapping[str, Any] = field(default_factory=dict)
+
+class _McpCancellation:
+    """Thread-safe bridge from an MCP cancellation notification to a task."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, task: asyncio.Task) -> None:
+        self._loop = loop
+        self._task = task
+        self._cancelled = threading.Event()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def cancel(self, reason: str | None = None) -> None:
+        if self._cancelled.is_set():
+            return
+        self._cancelled.set()
+        self._loop.call_soon_threadsafe(self._task.cancel, reason)
+
 
 @dataclass(frozen=True)
 class McpRequestContext:
@@ -616,15 +635,11 @@ class McpServer:
         self._http_sessions_lock = threading.Lock()
         self.max_http_sessions = 1024
         self._stdio_protocol_version: str | None = None
-        self._pending_requests: dict[tuple[str | None, int | str], threading.Event] = {}
+        self._pending_requests: dict[tuple[str | None, int | str], _McpCancellation] = {}
         self._pending_requests_lock = threading.Lock()
         self._context_var: contextvars.ContextVar[McpRequestContext] = contextvars.ContextVar(
             f"zeromcp_request_context_{id(self)}",
             default=McpRequestContext(),
-        )
-        self._cancel_event_var: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
-            f"zeromcp_cancel_event_{id(self)}",
-            default=None,
         )
         self._oauth_config: McpOAuthConfig | None = None
         self.require_streamable_http_session = False
@@ -654,14 +669,6 @@ class McpServer:
             yield
         finally:
             self._context_var.reset(token)
-
-    @contextmanager
-    def _cancel_scope(self, cancel_event: threading.Event | None):
-        token = self._cancel_event_var.set(cancel_event)
-        try:
-            yield
-        finally:
-            self._cancel_event_var.reset(token)
 
     def oauth(
         self,
@@ -849,7 +856,7 @@ class McpServer:
                 protocol_version=active_protocol_version,
                 transport_session_id="stdio:default",
             ):
-                response = await asyncio.to_thread(self._dispatch_mcp, request)
+                response = await self._dispatch_mcp_async(request)
             # Concurrent tasks race on this attribute, but initialize is the first
             # request in practice and stale reads only see the default version.
             if request_method == "initialize" and response is not None and "error" not in response:
@@ -875,11 +882,6 @@ class McpServer:
 
         if tasks:
             await asyncio.gather(*tasks)
-
-    def check_cancelled(self) -> None:
-        event = self._cancel_event_var.get()
-        if event is not None and event.is_set():
-            raise JsonRpcNoResponse()
 
     def _stdio_request_protocol(self, body: dict | bytes | bytearray) -> tuple[str | None, str]:
         try:
@@ -1029,7 +1031,7 @@ class McpServer:
             },
             lambda tool_response: self._format_tool_response(name, tool_response),
             meta=_meta,
-            cancellable=True,
+            cancellable=_is_async_callable(self.tools.methods.get(name)),
         )
 
     def _dispatch_nested_mcp(
@@ -1043,8 +1045,18 @@ class McpServer:
     ):
         if self.registry._in_async_dispatch():
             return self._dispatch_nested_mcp_async(registry, request, formatter, meta=meta, cancellable=cancellable)
+        if cancellable:
+            return asyncio.run(
+                self._dispatch_nested_mcp_async(
+                    registry,
+                    request,
+                    formatter,
+                    meta=meta,
+                    cancellable=True,
+                )
+            )
 
-        with self._nested_mcp_scope(meta=meta, cancellable=cancellable):
+        with self._nested_mcp_scope(meta=meta, cancellable=False):
             response = registry.dispatch(request)
         if response is None:
             raise JsonRpcNoResponse()
@@ -1059,8 +1071,15 @@ class McpServer:
         meta: dict | None,
         cancellable: bool = False,
     ):
-        with self._nested_mcp_scope(meta=meta, cancellable=cancellable):
-            response = await registry.dispatch_async(request)
+        with self._nested_mcp_scope(meta=meta, cancellable=cancellable) as cancellation:
+            try:
+                response = await registry.dispatch_async(request)
+            except asyncio.CancelledError as exc:
+                if cancellation is None or not cancellation.cancelled:
+                    raise
+                raise JsonRpcNoResponse() from exc
+        if cancellation is not None and cancellation.cancelled:
+            raise JsonRpcNoResponse()
         if response is None:
             raise JsonRpcNoResponse()
         return formatter(response)
@@ -1068,30 +1087,32 @@ class McpServer:
     @contextmanager
     def _nested_mcp_scope(self, *, meta: dict | None, cancellable: bool = False):
         if cancellable:
-            request_id, cancel_event = self._register_cancel_event()
+            request_id, cancellation = self._register_cancellation()
         else:
             request_id = self.registry.current_request_id()
-            cancel_event = None
+            cancellation = None
 
-        cancel_scope = self._cancel_scope(cancel_event) if cancellable else nullcontext()
         try:
-            with self._context_scope(request_id=request_id, meta=meta), cancel_scope:
-                yield
+            with self._context_scope(request_id=request_id, meta=meta):
+                yield cancellation
         finally:
             if cancellable:
-                self._unregister_cancel_event(request_id)
+                self._unregister_cancellation(request_id)
 
-    def _register_cancel_event(self) -> tuple[int | str | None, threading.Event | None]:
+    def _register_cancellation(self) -> tuple[int | str | None, _McpCancellation | None]:
         request_id = self.registry.current_request_id()
-        cancel_event: threading.Event | None = None
+        cancellation: _McpCancellation | None = None
         if request_id is not None:
-            cancel_event = threading.Event()
+            task = asyncio.current_task()
+            if task is None:
+                raise RuntimeError("async MCP cancellation requires an asyncio task")
+            cancellation = _McpCancellation(asyncio.get_running_loop(), task)
             key = (self.get_current_transport_session_id(), request_id)
             with self._pending_requests_lock:
-                self._pending_requests[key] = cancel_event
-        return request_id, cancel_event
+                self._pending_requests[key] = cancellation
+        return request_id, cancellation
 
-    def _unregister_cancel_event(self, request_id: int | str | None) -> None:
+    def _unregister_cancellation(self, request_id: int | str | None) -> None:
         if request_id is not None:
             with self._pending_requests_lock:
                 self._pending_requests.pop((self.get_current_transport_session_id(), request_id), None)
@@ -1137,9 +1158,9 @@ class McpServer:
         """MCP notifications/cancelled method"""
         key = (self.get_current_transport_session_id(), requestId)
         with self._pending_requests_lock:
-            event = self._pending_requests.get(key)
-        if event is not None:
-            event.set()
+            cancellation = self._pending_requests.get(key)
+            if cancellation is not None:
+                cancellation.cancel(reason)
 
     def _structured_content_for_tool(self, name: str, result: Any) -> dict | None:
         func = self.tools.methods.get(name)
@@ -1206,7 +1227,7 @@ class McpServer:
             },
             lambda resource_response: self._format_resource_response(uri, resource_response),
             meta=_meta,
-            cancellable=True,
+            cancellable=_is_async_callable(self.resources.methods.get(name)),
         )
 
     def _format_resource_response(self, uri: str, resource_response: Mapping[str, Any]) -> dict:
@@ -1246,7 +1267,7 @@ class McpServer:
             },
             self._format_prompt_response,
             meta=_meta,
-            cancellable=True,
+            cancellable=_is_async_callable(self.prompts.methods.get(name)),
         )
 
     def _format_prompt_response(self, prompt_response: Mapping[str, Any]) -> dict:
