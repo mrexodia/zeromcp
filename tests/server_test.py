@@ -389,7 +389,7 @@ def test_literal_fields_generate_json_schema_enums():
         IDALIB = "idalib"
 
     class Instance(TypedDict):
-        backend: Literal["gui", "idalib"]
+        backend: Literal[Backend.GUI, Backend.IDALIB]
         status: Literal["available", "attached", "current", "unavailable"]
 
     class Result(TypedDict):
@@ -398,7 +398,7 @@ def test_literal_fields_generate_json_schema_enums():
     @server.tool
     def list_instances(backend: Literal[Backend.GUI, Backend.IDALIB] = Backend.GUI) -> Result:
         assert isinstance(backend, Backend)
-        return {"instances": [{"backend": backend.value, "status": "available"}]}
+        return {"instances": [{"backend": backend, "status": "available"}]}
 
     response = server._dispatch_mcp({
         "jsonrpc": "2.0",
@@ -430,7 +430,9 @@ def test_literal_fields_generate_json_schema_enums():
         "id": 2,
     })
     assert call_response is not None
+    json.dumps(call_response)
     assert call_response["result"]["structuredContent"]["instances"][0]["backend"] == "idalib"
+    assert json.loads(call_response["result"]["content"][0]["text"])["instances"][0]["backend"] == "idalib"
     print("✓ PASS")
 
 
