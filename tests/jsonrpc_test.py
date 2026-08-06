@@ -6,8 +6,7 @@ import json
 import sys
 import traceback
 import re
-from enum import Enum
-from typing import Optional, Any, Literal, TypedDict
+from typing import Optional, Any, TypedDict
 
 from zeromcp.jsonrpc import JsonRpcRegistry
 
@@ -53,51 +52,6 @@ def exact_union_test(value: float | bool | int) -> str:
 @jsonrpc.method
 def list_test(items: list[str]) -> int:
     return len(items)
-
-@jsonrpc.method
-def literal_test(mode: Literal["fast", "safe"]) -> str:
-    return mode
-
-@jsonrpc.method
-def literal_union_test(mode: Literal["auto"] | int) -> str:
-    return str(mode)
-
-@jsonrpc.method
-def nullable_literal_test(mode: Literal["auto", None]) -> str:
-    return repr(mode)
-
-@jsonrpc.method
-def nullable_literal_union_test(mode: Literal[None] | str) -> str:
-    return repr(mode)
-
-class NullMode(Enum):
-    NULL = None
-
-@jsonrpc.method
-def nullable_enum_literal_union_test(mode: Literal[NullMode.NULL] | str) -> str:
-    return mode.name if isinstance(mode, NullMode) else mode
-
-class Ratio(Enum):
-    ONE = 1.0
-
-@jsonrpc.method
-def numeric_enum_literal_test(ratio: Literal[Ratio.ONE]) -> str:
-    return ratio.name
-
-class BackendMode(Enum):
-    GUI = "gui"
-
-class NestedLiteralOptions(TypedDict):
-    backend: Literal[BackendMode.GUI]
-    fallbacks: list[Literal[BackendMode.GUI]]
-    aliases: dict[str, Literal[BackendMode.GUI]]
-
-@jsonrpc.method
-def nested_literal_test(options: NestedLiteralOptions) -> str:
-    assert options["backend"] is BackendMode.GUI
-    assert options["fallbacks"] == [BackendMode.GUI]
-    assert options["aliases"] == {"default": BackendMode.GUI}
-    return "ok"
 
 @jsonrpc.method
 def exception():
@@ -404,56 +358,38 @@ def run_all_tests():
     )
 
     # ========================================
-    # PARAMETER VALIDATION TESTS
+    # ARGUMENT BINDING TESTS
     # ========================================
 
-    # Wrong number of positional params - too few
+    # Python handles argument binding; annotations are not revalidated here.
     check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [42], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: expected at least 2 arguments, got 1"}, "id": 1},
+        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "regex:^Invalid params: .*missing.*subtrahend"}, "id": 1},
         "Invalid params - too few positional arguments"
     )
 
-    # Wrong number of positional params - too many
     check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [42, 23, 10], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: expected at most 2 arguments, got 3"}, "id": 1},
+        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "regex:^Invalid params: .*positional arguments"}, "id": 1},
         "Invalid params - too many positional arguments"
     )
 
-    # Missing required named param
     check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42}, "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: missing required parameters: ['subtrahend']"}, "id": 1},
+        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "regex:^Invalid params: .*missing.*subtrahend"}, "id": 1},
         "Invalid params - missing required parameter"
     )
 
-    # Extra named param
     check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": 23, "extra": 1}, "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: unexpected parameters: ['extra']"}, "id": 1},
+        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "regex:^Invalid params: .*unexpected keyword.*extra"}, "id": 1},
         "Invalid params - unexpected parameter"
     )
 
-    # Wrong type - string instead of int
     check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": [42, "not a number"], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: subtrahend expected int, got str"}, "id": 1},
-        "Invalid params - wrong type (str instead of int)"
-    )
-
-    # Wrong type - list instead of int
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "subtract", "params": {"minuend": 42, "subtrahend": [1, 2]}, "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: subtrahend expected int, got list"}, "id": 1},
-        "Invalid params - wrong type (list instead of int)"
-    )
-
-    # Null for non-optional param
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "subtract", "params": [42, null], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: subtrahend cannot be null"}, "id": 1},
-        "Invalid params - null for non-optional parameter"
+        {"jsonrpc": "2.0", "error": {"code": -32603, "message": "regex:unsupported operand"}, "id": 1},
+        "Annotations are not runtime validation"
     )
 
     # Params is invalid type (not array or object)
@@ -471,7 +407,7 @@ def run_all_tests():
 
     check_rpc(
         '{"jsonrpc": "2.0", "method": "subtract", "params": null, "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Missing required params"}, "id": 1},
+        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "regex:^Invalid params: .*missing"}, "id": 1},
         "Invalid params - null for required params"
     )
 
@@ -546,11 +482,11 @@ def run_all_tests():
         "Union type (int | str) - str value"
     )
 
-    # Union type - invalid type
+    # Type annotations are schema metadata, not runtime validation.
     check_rpc(
         '{"jsonrpc": "2.0", "method": "union_test", "params": [[1, 2, 3]], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: id union does not contain list"}, "id": 1},
-        "Union type (int | str) - invalid list"
+        {"jsonrpc": "2.0", "result": "ID: [1, 2, 3]", "id": 1},
+        "Union annotation is not revalidated"
     )
 
     # Union type - null
@@ -601,102 +537,11 @@ def run_all_tests():
         "Generic type list[str] - valid list"
     )
 
-    # list[T] - wrong outer type
+    # The function receives decoded JSON directly, regardless of annotations.
     check_rpc(
         '{"jsonrpc": "2.0", "method": "list_test", "params": ["not a list"], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: items expected list, got str"}, "id": 1},
-        "Generic type list[str] - wrong outer type"
-    )
-
-    # Literal - valid value
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "literal_test", "params": ["fast"], "id": 1}',
-        {"jsonrpc": "2.0", "result": "fast", "id": 1},
-        "Literal - valid value"
-    )
-
-    # Literal - invalid value
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "literal_test", "params": ["other"], "id": 1}',
-        {
-            "jsonrpc": "2.0",
-            "error": {
-                "code": -32602,
-                "message": "Invalid params: mode expected one of ['fast', 'safe'], got 'other'",
-            },
-            "id": 1,
-        },
-        "Literal - invalid value"
-    )
-
-    # Literal nested in a union
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "literal_union_test", "params": ["auto"], "id": 1}',
-        {"jsonrpc": "2.0", "result": "auto", "id": 1},
-        "Literal union - literal value"
-    )
-
-    # Literal containing None accepts JSON null
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "nullable_literal_test", "params": [null], "id": 1}',
-        {"jsonrpc": "2.0", "result": "None", "id": 1},
-        "Literal - null member"
-    )
-
-    # A nested Literal union arm accepts JSON null
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "nullable_literal_union_test", "params": [null], "id": 1}',
-        {"jsonrpc": "2.0", "result": "None", "id": 1},
-        "Literal union - null member"
-    )
-
-    # An Enum Literal whose JSON wire value is null also accepts JSON null
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "nullable_enum_literal_union_test", "params": [null], "id": 1}',
-        {"jsonrpc": "2.0", "result": "NULL", "id": 1},
-        "Enum Literal union - null wire value"
-    )
-
-    # JSON integers and floats use the same numeric equality semantics
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "numeric_enum_literal_test", "params": [1], "id": 1}',
-        {"jsonrpc": "2.0", "result": "ONE", "id": 1},
-        "Enum Literal - equivalent JSON number"
-    )
-
-    # JSON booleans remain distinct from numbers
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "numeric_enum_literal_test", "params": [true], "id": 1}',
-        {
-            "jsonrpc": "2.0",
-            "error": {
-                "code": -32602,
-                "message": "Invalid params: ratio expected one of [<Ratio.ONE: 1.0>], got True",
-            },
-            "id": 1,
-        },
-        "Enum Literal - boolean is not a number"
-    )
-
-    # Literal enum values are converted recursively inside containers
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "nested_literal_test", "params": [{"backend": "gui", "fallbacks": ["gui"], "aliases": {"default": "gui"}}], "id": 1}',
-        {"jsonrpc": "2.0", "result": "ok", "id": 1},
-        "Enum Literal - nested container conversion"
-    )
-
-    # Schema-invalid nested Literal values are rejected
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "nested_literal_test", "params": [{"backend": "other", "fallbacks": [], "aliases": {}}], "id": 1}',
-        {
-            "jsonrpc": "2.0",
-            "error": {
-                "code": -32602,
-                "message": "Invalid params: options.backend expected one of [<BackendMode.GUI: 'gui'>], got 'other'",
-            },
-            "id": 1,
-        },
-        "Enum Literal - reject invalid nested value"
+        {"jsonrpc": "2.0", "result": 10, "id": 1},
+        "Generic annotation is not revalidated"
     )
 
     # Point TypedDict - valid dict
@@ -706,18 +551,11 @@ def run_all_tests():
         "TypedDict Point - valid dict"
     )
 
-    # Point TypedDict - wrong outer type
-    check_rpc(
-        '{"jsonrpc": "2.0", "method": "point_pretty", "params": ["not a dict"], "id": 1}',
-        {"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params: p expected dict, got str"}, "id": 1},
-        "TypedDict Point - wrong outer type"
-    )
-
-    # Convert from int to float
+    # Numeric JSON values are passed through without coercion.
     check_rpc(
         '{"jsonrpc": "2.0", "method": "round_float", "params": [3], "id": 1}',
         {"jsonrpc": "2.0", "result": 3, "id": 1},
-        "Convert int to float for float parameter"
+        "Numeric value passed through"
     )
 
     # Any type - various inputs

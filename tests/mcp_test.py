@@ -194,17 +194,17 @@ async def exercise_edge_cases(prefix: str, session: ClientSession):
         assert "not found" in e.error.message, "expected method not found error"
         print(f"[{prefix}] Non-existent tool error: {e.error.message}")
 
-    # Test missing required parameter. 2025-11-25 reports tool input validation
+    # Test Python argument binding. 2025-11-25 reports invalid tool arguments
     # as a tool execution error; older versions report a protocol error.
     try:
         result = await session.call_tool("divide", arguments={"numerator": 42})
         assert result.isError, "missing denominator should return a tool error"
         content = result.content[0]
         assert isinstance(content, types.TextContent), "expected TextContent"
-        assert "missing required" in content.text, "expected missing parameter error"
+        assert "missing" in content.text, "expected missing parameter error"
         print(f"[{prefix}] Missing param tool error: {content.text}")
     except McpError as e:
-        assert "missing required" in e.error.message, "expected missing parameter error"
+        assert "missing" in e.error.message, "expected missing parameter error"
         print(f"[{prefix}] Missing param protocol error: {e.error.message}")
 
     # Test division by zero (natural exception)

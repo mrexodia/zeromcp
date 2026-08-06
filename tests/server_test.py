@@ -329,7 +329,7 @@ def test_stdio_preserves_negotiated_protocol_version():
     assert responses[0]["result"]["protocolVersion"] == "2025-11-25"
     tool_result = responses[1]["result"]
     assert tool_result["isError"]
-    assert "missing required" in tool_result["content"][0]["text"]
+    assert "missing" in tool_result["content"][0]["text"]
     print("✓ PASS")
 
 
@@ -358,7 +358,7 @@ def test_protocol_specific_tool_argument_errors():
     assert new_response is not None
     result = new_response["result"]
     assert result["isError"] is True, "2025-11-25 treats invalid tool args as tool execution errors"
-    assert "missing required" in result["content"][0]["text"]
+    assert "missing" in result["content"][0]["text"]
     print("✓ PASS")
 
 
@@ -384,7 +384,7 @@ def test_literal_fields_generate_json_schema_enums():
     print("Testing Literal fields generate JSON Schema enums...")
     server = McpServer("literal-schema-test")
 
-    class Backend(Enum):
+    class Backend(str, Enum):
         GUI = "gui"
         IDALIB = "idalib"
 
@@ -397,7 +397,6 @@ def test_literal_fields_generate_json_schema_enums():
 
     @server.tool
     def list_instances(backend: Literal[Backend.GUI, Backend.IDALIB] = Backend.GUI) -> Result:
-        assert isinstance(backend, Backend)
         return {"instances": [{"backend": backend, "status": "available"}]}
 
     response = server._dispatch_mcp({
@@ -411,6 +410,7 @@ def test_literal_fields_generate_json_schema_enums():
     assert tool["inputSchema"]["properties"]["backend"] == {
         "type": "string",
         "enum": ["gui", "idalib"],
+        "default": "gui",
     }
     properties = tool["outputSchema"]["properties"]
     instance_properties = properties["instances"]["items"]["properties"]
@@ -433,128 +433,36 @@ def test_literal_fields_generate_json_schema_enums():
     json.dumps(call_response)
     assert call_response["result"]["structuredContent"]["instances"][0]["backend"] == "idalib"
     assert json.loads(call_response["result"]["content"][0]["text"])["instances"][0]["backend"] == "idalib"
+
+    # Clients enforce the advertised enum. The server passes decoded JSON through.
+    unchecked_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "list_instances", "arguments": {"backend": "unchecked"}},
+        "id": 3,
+    })
+    assert unchecked_response is not None
+    assert unchecked_response["result"]["structuredContent"]["instances"][0]["backend"] == "unchecked"
     print("✓ PASS")
 
 
-def test_enum_literal_container_values():
-    print("Testing container-valued Enum Literals...")
-    server = McpServer("literal-container-test")
+def test_literal_enums_must_derive_from_str():
+    print("Testing only str-derived Enum Literals are supported...")
+    server = McpServer("literal-enum-type-test")
 
-    class Token(Enum):
-        X = "x"
+    class Plain(Enum):
+        VALUE = "value"
 
-    class Choice(Enum):
-        ITEMS = [Token.X, 1]
-        OPTIONS = {"token": Token.X, "counts": [1, 2.0]}
+    class Numeric(Enum):
+        VALUE = 1
 
-    @server.tool
-    def choose(
-        items: Literal[Choice.ITEMS],
-        options: Literal[Choice.OPTIONS],
-    ) -> str:
-        assert items is Choice.ITEMS
-        assert options is Choice.OPTIONS
-        return "ok"
-
-    list_response = server._dispatch_mcp({
-        "jsonrpc": "2.0",
-        "method": "tools/list",
-        "id": 1,
-    })
-    assert list_response is not None
-    json.dumps(list_response)
-    properties = list_response["result"]["tools"][0]["inputSchema"]["properties"]
-    assert properties["items"] == {
-        "type": "array",
-        "enum": [["x", 1]],
-    }
-    assert properties["options"] == {
-        "type": "object",
-        "enum": [{"token": "x", "counts": [1, 2.0]}],
-    }
-
-    call_response = server._dispatch_mcp({
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": "choose",
-            "arguments": {
-                "items": ["x", 1.0],
-                "options": {"token": "x", "counts": [1.0, 2]},
-            },
-        },
-        "id": 2,
-    })
-    assert call_response is not None
-    assert call_response["result"]["content"][0]["text"] == "ok"
-    print("✓ PASS")
-
-
-def test_enum_mapping_keys_are_serialized():
-    print("Testing Enum mapping keys are serialized to their wire values...")
-    server = McpServer("enum-mapping-key-test")
-
-    class Key(Enum):
-        NAME = "name"
-
-    @server.tool
-    def echo(values: dict[Literal[Key.NAME], str]) -> dict[Literal[Key.NAME], str]:
-        assert values == {Key.NAME: "value"}
-        return values
-
-    response = server._dispatch_mcp({
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": "echo",
-            "arguments": {"values": {"name": "value"}},
-        },
-        "id": 1,
-    })
-    assert response is not None
-    json.dumps(response)
-    result = response["result"]
-    assert result["structuredContent"] == {"name": "value"}
-    assert json.loads(result["content"][0]["text"]) == {"name": "value"}
-    print("✓ PASS")
-
-
-def test_enum_mapping_key_collisions_are_rejected():
-    print("Testing collisions between Enum and wire mapping keys are rejected...")
-    server = McpServer("enum-mapping-key-collision-test")
-
-    class Key(Enum):
-        NAME = "name"
-
-    class Choice(Enum):
-        DUPLICATE = {Key.NAME: 1, "name": 2}
-
-    @server.tool
-    def choose(value: Literal[Choice.DUPLICATE]) -> str:
-        return "unreachable"
-
-    list_response = server._dispatch_mcp({
-        "jsonrpc": "2.0",
-        "method": "tools/list",
-        "id": 1,
-    })
-    assert list_response is not None
-    assert list_response["error"]["code"] == -32603
-    assert "normalizes to duplicate JSON key 'name'" in list_response["error"]["message"]
-
-    @server.tool
-    def duplicate_result() -> dict:
-        return {Key.NAME: 1, "name": 2}
-
-    call_response = server._dispatch_mcp({
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {"name": "duplicate_result", "arguments": {}},
-        "id": 2,
-    })
-    assert call_response is not None
-    assert call_response["error"]["code"] == -32603
-    assert "normalizes to duplicate JSON key 'name'" in call_response["error"]["message"]
+    for annotation in (Literal[Plain.VALUE], Literal[Numeric.VALUE]):
+        try:
+            server._type_to_json_schema(annotation)
+        except TypeError as exc:
+            assert "must derive from str" in str(exc)
+        else:
+            raise AssertionError(f"Expected {annotation!r} to be rejected")
     print("✓ PASS")
 
 
@@ -1448,9 +1356,7 @@ def run_all_tests():
         test_protocol_specific_tool_argument_errors()
         test_tool_schema_includes_future_fields_for_all_versions()
         test_literal_fields_generate_json_schema_enums()
-        test_enum_literal_container_values()
-        test_enum_mapping_keys_are_serialized()
-        test_enum_mapping_key_collisions_are_rejected()
+        test_literal_enums_must_derive_from_str()
         test_str_tool_result_is_unstructured_text()
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()

@@ -20,31 +20,18 @@ from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
-from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse, _is_async_callable, _literal_json_value
+from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse, _is_async_callable
 
 
-def _json_wire_value(value: Any) -> Any:
-    """Recursively replace Enum members, including mapping keys, with wire values."""
+def _literal_json_value(value: Any) -> str | int | float | bool | None:
+    """Return a JSON scalar, allowing only Enum members derived from str."""
     if isinstance(value, Enum):
-        return _literal_json_value(value)
-    if isinstance(value, Mapping):
-        result = {}
-        for key, item in value.items():
-            original_key = key
-            if isinstance(key, Enum):
-                wire_key = _literal_json_value(key)
-                if wire_key is not None and type(wire_key) not in (str, int, float, bool):
-                    raise TypeError(f"Enum mapping key {key!r} has a non-scalar JSON value")
-                key = wire_key
-            if key in result:
-                raise TypeError(
-                    f"Mapping key {original_key!r} normalizes to duplicate JSON key {key!r}"
-                )
-            result[key] = _json_wire_value(item)
-        return result
-    if isinstance(value, (list, tuple)):
-        return [_json_wire_value(item) for item in value]
-    return value
+        if not isinstance(value, str):
+            raise TypeError(f"Enum Literal member {value!r} must derive from str")
+        return value.value
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    raise TypeError(f"Literal member {value!r} is not a JSON scalar")
 
 
 # Deliberately not the newest supported version: older, half-compliant clients
@@ -649,6 +636,8 @@ class McpServer:
         self.tools = McpRpcRegistry()
         self.resources = McpRpcRegistry()
         self.prompts = McpRpcRegistry()
+        self._tool_is_async: dict[str, bool] = {}
+        self._tool_result_modes: dict[str, str] = {}
 
         self._http_server: HTTPServer | None = None
         self._server_thread: threading.Thread | None = None
@@ -746,6 +735,9 @@ class McpServer:
         def decorator(inner: Callable) -> Callable:
             if annotations:
                 setattr(inner, "__mcp_tool_annotations__", annotations)
+            name = getattr(inner, "__name__", inner.__class__.__name__)
+            self._tool_is_async[name] = _is_async_callable(inner)
+            self._tool_result_modes.pop(name, None)
             return self.tools.method(inner)
 
         return decorator if func is None else decorator(func)
@@ -1046,7 +1038,11 @@ class McpServer:
 
     def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None):
         """MCP tools/call method"""
-        # Wrap tool call in JSON-RPC request so argument validation stays shared.
+        is_async = self._tool_is_async.get(name)
+        if is_async is None:
+            is_async = _is_async_callable(self.tools.methods.get(name))
+            self._tool_is_async[name] = is_async
+
         return self._dispatch_nested_mcp(
             self.tools,
             {
@@ -1057,7 +1053,7 @@ class McpServer:
             },
             lambda tool_response: self._format_tool_response(name, tool_response),
             meta=_meta,
-            cancellable=_is_async_callable(self.tools.methods.get(name)),
+            cancellable=is_async,
         )
 
     def _dispatch_nested_mcp(
@@ -1166,7 +1162,7 @@ class McpServer:
                 "isError": True,
             }
 
-        result = _json_wire_value(tool_response.get("result"))
+        result = tool_response.get("result")
         content = result if isinstance(result, str) else json.dumps(result, indent=2)
         mcp_result = {
             "content": [{"type": "text", "text": content}],
@@ -1189,15 +1185,23 @@ class McpServer:
                 cancellation.cancel(reason)
 
     def _structured_content_for_tool(self, name: str, result: Any) -> dict | None:
-        func = self.tools.methods.get(name)
-        if func is not None:
-            return_type = get_type_hints(func, include_extras=True).get("return")
+        mode = self._tool_result_modes.get(name)
+        if mode is None:
+            func = self.tools.methods.get(name)
+            return_type = get_type_hints(func, include_extras=True).get("return") if func else None
             if self._type_is_plain_str(return_type):
-                return None
-            if return_type and return_type is not type(None) and return_type is not Any:
-                if not self._schema_is_object_like(self._type_to_json_schema(return_type)):
-                    return {"result": result}
-        return result if isinstance(result, dict) else {"result": result}
+                mode = "text"
+            elif return_type and return_type is not type(None) and return_type is not Any:
+                mode = "object" if self._schema_is_object_like(self._type_to_json_schema(return_type)) else "wrapped"
+            else:
+                mode = "object"
+            self._tool_result_modes[name] = mode
+
+        if mode == "text":
+            return None
+        if mode == "object" and isinstance(result, dict):
+            return result
+        return {"result": result}
 
     def _enumerate_resources(self):
         for name, func in self.resources.methods.items():
@@ -1393,7 +1397,8 @@ class McpServer:
             value_types = {type(value) for value in values}
             if len(value_types) == 1:
                 value_schema = self._type_to_json_schema(next(iter(value_types)))
-                schema = {**value_schema, **schema}
+                if value_schema.get("type") != "object":
+                    schema = {**value_schema, **schema}
             return schema
 
         # Union[Ts..], Optional[T] and T1 | T2

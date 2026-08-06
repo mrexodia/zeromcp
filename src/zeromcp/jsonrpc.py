@@ -3,81 +3,7 @@ import contextvars
 import inspect
 import json
 import traceback
-from collections.abc import Mapping
-from typing import Annotated, Any, Callable, Literal, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, Required, is_typeddict
-from types import UnionType
-from enum import Enum
-
-
-def _literal_json_value(value: Any) -> Any:
-    """Return the recursively normalized JSON wire value of a Literal member."""
-    if isinstance(value, Enum):
-        return _literal_json_value(value.value)
-    if value is None or type(value) in (str, int, float, bool):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_literal_json_value(item) for item in value]
-    if isinstance(value, Mapping):
-        result = {}
-        for key, item in value.items():
-            wire_key = _literal_json_value(key) if isinstance(key, Enum) else key
-            if type(wire_key) is not str:
-                raise TypeError(f"Literal mapping key {key!r} is not representable in JSON")
-            if wire_key in result:
-                raise TypeError(
-                    f"Literal mapping key {key!r} normalizes to duplicate JSON key {wire_key!r}"
-                )
-            result[wire_key] = _literal_json_value(item)
-        return result
-    raise TypeError(f"Literal member {value!r} is not representable in JSON")
-
-
-def _json_values_equal(value: Any, wire_value: Any, *, numeric_equivalence: bool) -> bool:
-    value_is_number = type(value) in (int, float)
-    wire_value_is_number = type(wire_value) in (int, float)
-    if value_is_number or wire_value_is_number:
-        return (
-            value_is_number
-            and wire_value_is_number
-            and (numeric_equivalence or type(value) is type(wire_value))
-            and value == wire_value
-        )
-    if type(value) is not type(wire_value):
-        return False
-    if isinstance(value, list):
-        return len(value) == len(wire_value) and all(
-            _json_values_equal(item, wire_item, numeric_equivalence=numeric_equivalence)
-            for item, wire_item in zip(value, wire_value)
-        )
-    if isinstance(value, dict):
-        return value.keys() == wire_value.keys() and all(
-            _json_values_equal(value[key], wire_value[key], numeric_equivalence=numeric_equivalence)
-            for key in value
-        )
-    return value == wire_value
-
-
-def _match_literal(value: Any, members: tuple[Any, ...]) -> tuple[bool, Any]:
-    for member in members:
-        wire_value = _literal_json_value(member)
-        if _json_values_equal(value, wire_value, numeric_equivalence=True):
-            return True, member
-    return False, value
-
-
-def _match_json_null(py_type: Any) -> tuple[bool, Any]:
-    if py_type is type(None):
-        return True, None
-    origin = get_origin(py_type)
-    args = get_args(py_type)
-    if origin is Literal:
-        return _match_literal(None, args)
-    if origin in (Union, UnionType):
-        for arg in args:
-            matched, literal_value = _match_json_null(arg)
-            if matched:
-                return True, literal_value
-    return False, None
+from typing import Any, Callable, TypedDict, TypeAlias, NotRequired
 
 
 
@@ -119,7 +45,6 @@ class JsonRpcNoResponse(Exception):
 class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
-        self._cache: dict[Callable, tuple[inspect.Signature, dict, list[str]]] = {}
         self._current_request: contextvars.ContextVar[JsonRpcId] = contextvars.ContextVar("zeromcp_current_request_id", default=None)
         self._async_dispatch: contextvars.ContextVar[bool] = contextvars.ContextVar("zeromcp_async_dispatch", default=False)
         self.redact_exceptions = False
@@ -254,204 +179,35 @@ class JsonRpcRegistry:
             "message": "\n".join(traceback.format_exception(e)).strip() + "\n\nPlease report a bug!",
         }
 
-    def _is_exact_union_match(self, value: Any, expected_type: Any) -> bool:
-        if expected_type is Any:
-            return False
-
-        origin = get_origin(expected_type)
-        args = get_args(expected_type)
-        if origin in (Annotated, Required, NotRequired):
-            return self._is_exact_union_match(value, args[0])
-        if origin is Literal:
-            return any(
-                _json_values_equal(
-                    value,
-                    _literal_json_value(member),
-                    numeric_equivalence=False,
-                )
-                for member in args
-            )
-        if origin in (Union, UnionType):
-            return any(self._is_exact_union_match(value, arg_type) for arg_type in args)
-        if is_typeddict(expected_type):
-            return isinstance(value, dict)
-        if origin is not None:
-            try:
-                return isinstance(value, origin)
-            except TypeError:
-                return False
-        return isinstance(expected_type, type) and type(value) is expected_type
-
-    def _validate_value(self, param_name: str, value: Any, expected_type: Any) -> Any:
-        if expected_type is Any:
-            return value
-
-        origin = get_origin(expected_type)
-        args = get_args(expected_type)
-
-        if origin in (Annotated, Required, NotRequired):
-            return self._validate_value(param_name, value, args[0])
-
-        if value is None:
-            matched, literal_value = _match_json_null(expected_type)
-            if not matched:
-                raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
-            return literal_value
-
-        if origin is Literal:
-            matched, literal_value = _match_literal(value, args)
-            if not matched:
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: {param_name} expected one of {list(args)!r}, got {value!r}",
-                )
-            return literal_value
-
-        if origin in (Union, UnionType):
-            exact_args = [arg_type for arg_type in args if self._is_exact_union_match(value, arg_type)]
-            fallback_args = [arg_type for arg_type in args if not self._is_exact_union_match(value, arg_type)]
-            for arg_type in (*exact_args, *fallback_args):
-                try:
-                    return self._validate_value(param_name, value, arg_type)
-                except JsonRpcException:
-                    pass
-            raise JsonRpcException(
-                -32602,
-                f"Invalid params: {param_name} union does not contain {type(value).__name__}",
-            )
-
-        if origin is list:
-            if not isinstance(value, list):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: {param_name} expected list, got {type(value).__name__}",
-                )
-            item_type = args[0] if args else Any
-            return [
-                self._validate_value(f"{param_name}[{index}]", item, item_type)
-                for index, item in enumerate(value)
-            ]
-
-        if origin is dict:
-            if not isinstance(value, dict):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: {param_name} expected dict, got {type(value).__name__}",
-                )
-            key_type, value_type = args if len(args) == 2 else (Any, Any)
-            return {
-                self._validate_value(f"{param_name} key", key, key_type): self._validate_value(
-                    f"{param_name}[{key!r}]", item, value_type
-                )
-                for key, item in value.items()
-            }
-
-        if is_typeddict(expected_type):
-            if not isinstance(value, dict):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: {param_name} expected dict, got {type(value).__name__}",
-                )
-            field_types = get_type_hints(expected_type, include_extras=True)
-            return {
-                key: self._validate_value(f"{param_name}.{key}", item, field_types[key])
-                if key in field_types else item
-                for key, item in value.items()
-            }
-
-        if origin is not None:
-            if not isinstance(value, origin):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: {param_name} expected {origin.__name__}, got {type(value).__name__}",
-                )
-            return value
-
-        if isinstance(expected_type, type):
-            if expected_type is float and isinstance(value, int):
-                return float(value)
-            if not isinstance(value, expected_type):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: {param_name} expected {expected_type.__name__}, got {type(value).__name__}",
-                )
-
-        return value
-
     def _call(self, method: str, params: Any) -> Any:
-        if method not in self.methods:
-            raise JsonRpcException(-32601, f"Method '{method}' not found")
+        try:
+            func = self.methods[method]
+        except KeyError:
+            raise JsonRpcException(-32601, f"Method '{method}' not found") from None
 
-        func = self.methods[method]
-
-        # Check for cached reflection data
-        if func not in self._cache:
-            sig = inspect.signature(func)
-            hints = get_type_hints(func)
-            hints.pop("return", None)
-
-            # Determine required vs optional parameters
-            required_params = []
-            for param_name, param in sig.parameters.items():
-                if param.default is inspect.Parameter.empty:
-                    required_params.append(param_name)
-
-            self._cache[func] = (sig, hints, required_params)
-
-        sig, hints, required_params = self._cache[func]
-
-        # Handle None params
         if params is None:
-            if len(required_params) == 0:
-                return func()
-            else:
-                raise JsonRpcException(-32602, "Missing required params")
-
-        # Convert list params to dict by parameter names
-        if isinstance(params, list):
-            if len(params) < len(required_params):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: expected at least {len(required_params)} arguments, got {len(params)}"
-                )
-            if len(params) > len(sig.parameters):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: expected at most {len(sig.parameters)} arguments, got {len(params)}"
-                )
-            params = dict(zip(sig.parameters.keys(), params))
-
-        # Validate dict params
-        if isinstance(params, dict):
-            # Check all required params are present
-            missing = set(required_params) - set(params.keys())
-            if missing:
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: missing required parameters: {list(missing)}"
-                )
-
-            # Check no extra params
-            extra = set(params.keys()) - set(sig.parameters.keys())
-            if extra:
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: unexpected parameters: {list(extra)}"
-                )
-
-            validated_params = {}
-            for param_name, value in params.items():
-                # If no type hint, pass through without validation
-                if param_name not in hints:
-                    validated_params[param_name] = value
-                    continue
-
-                validated_params[param_name] = self._validate_value(param_name, value, hints[param_name])
-
-            return func(**validated_params)
-
+            args, kwargs = (), {}
+        elif isinstance(params, list):
+            args, kwargs = params, {}
+        elif isinstance(params, dict):
+            args, kwargs = (), params
         else:
             raise JsonRpcException(-32602, "Invalid params: must be array or object")
+
+        try:
+            return func(*args, **kwargs)
+        except TypeError:
+            # Only inspect the signature on the error path. This distinguishes bad
+            # arguments from a TypeError raised inside the function.
+            try:
+                signature = inspect.signature(func)
+            except (TypeError, ValueError):
+                raise
+            try:
+                signature.bind(*args, **kwargs)
+            except TypeError as exc:
+                raise JsonRpcException(-32602, f"Invalid params: {exc}") from None
+            raise
 
     def _error(self, request_id: JsonRpcId, code: int, message: str, data: Any = None) -> JsonRpcResponse:
         error: JsonRpcError = {
