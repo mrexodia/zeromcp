@@ -24,11 +24,12 @@ from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoR
 
 
 def _literal_json_value(value: Any) -> str | int | float | bool | None:
-    """Return a JSON scalar, allowing only Enum members derived from str."""
+    """Return the JSON scalar represented by a Literal member."""
     if isinstance(value, Enum):
-        if not isinstance(value, str):
-            raise TypeError(f"Enum Literal member {value!r} must derive from str")
-        return value.value
+        enum_value = value.value
+        if type(enum_value) not in (str, int, float):
+            raise TypeError(f"Enum Literal member {value!r} must have a str, int, or float value")
+        return enum_value
     if value is None or type(value) in (str, int, float, bool):
         return value
     raise TypeError(f"Literal member {value!r} is not a JSON scalar")
@@ -1517,11 +1518,16 @@ class McpServer:
                 required.append(param_name)
             else:
                 try:
-                    json.dumps(param.default)
+                    default = (
+                        _literal_json_value(param.default)
+                        if isinstance(param.default, Enum)
+                        else param.default
+                    )
+                    json.dumps(default)
                 except TypeError:
                     pass
                 else:
-                    properties[param_name]["default"] = param.default
+                    properties[param_name]["default"] = default
 
         schema: dict[str, Any] = {
             "name": func_name,

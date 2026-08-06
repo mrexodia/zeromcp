@@ -446,23 +446,65 @@ def test_literal_fields_generate_json_schema_enums():
     print("✓ PASS")
 
 
-def test_literal_enums_must_derive_from_str():
-    print("Testing only str-derived Enum Literals are supported...")
+def test_literal_enum_schema_uses_scalar_values():
+    print("Testing Literal Enum schemas use string and numeric values...")
     server = McpServer("literal-enum-type-test")
 
-    class Plain(Enum):
+    class Label(Enum):
         VALUE = "value"
 
-    class Numeric(Enum):
-        VALUE = 1
+    class Count(Enum):
+        ONE = 1
 
-    for annotation in (Literal[Plain.VALUE], Literal[Numeric.VALUE]):
-        try:
-            server._type_to_json_schema(annotation)
-        except TypeError as exc:
-            assert "must derive from str" in str(exc)
-        else:
-            raise AssertionError(f"Expected {annotation!r} to be rejected")
+    class Ratio(Enum):
+        HALF = 0.5
+
+    class Unsupported(Enum):
+        VALUES = [1, 2]
+
+    assert server._type_to_json_schema(Literal[Label.VALUE]) == {
+        "type": "string",
+        "enum": ["value"],
+    }
+    assert server._type_to_json_schema(Literal[Count.ONE]) == {
+        "type": "integer",
+        "enum": [1],
+    }
+    assert server._type_to_json_schema(Literal[Ratio.HALF]) == {
+        "type": "number",
+        "enum": [0.5],
+    }
+
+    @server.tool
+    def choose(count: Literal[Count.ONE] = Count.ONE, ratio: Literal[Ratio.HALF] = Ratio.HALF) -> dict:
+        return {"count": count, "ratio": ratio}
+
+    list_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert list_response is not None
+    json.dumps(list_response)
+    properties = list_response["result"]["tools"][0]["inputSchema"]["properties"]
+    assert properties["count"] == {"type": "integer", "enum": [1], "default": 1}
+    assert properties["ratio"] == {"type": "number", "enum": [0.5], "default": 0.5}
+
+    call_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "choose", "arguments": {"count": 1, "ratio": 0.5}},
+        "id": 2,
+    })
+    assert call_response is not None
+    assert call_response["result"]["structuredContent"] == {"count": 1, "ratio": 0.5}
+
+    try:
+        server._type_to_json_schema(Literal[Unsupported.VALUES])
+    except TypeError as exc:
+        assert "must have a str, int, or float value" in str(exc)
+    else:
+        raise AssertionError("Expected container-valued Enum Literal to be rejected")
     print("✓ PASS")
 
 
@@ -1356,7 +1398,7 @@ def run_all_tests():
         test_protocol_specific_tool_argument_errors()
         test_tool_schema_includes_future_fields_for_all_versions()
         test_literal_fields_generate_json_schema_enums()
-        test_literal_enums_must_derive_from_str()
+        test_literal_enum_schema_uses_scalar_values()
         test_str_tool_result_is_unstructured_text()
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()
