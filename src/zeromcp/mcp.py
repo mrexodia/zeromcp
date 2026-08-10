@@ -615,9 +615,10 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             send_response(200, json.dumps(response).encode("utf-8"))
 
 class McpServer:
-    def __init__(self, name: str, version = "1.0.0"):
+    def __init__(self, name: str, version: str = "1.0.0", instructions: str | None = None):
         self.name = name
         self.version = version
+        self.instructions = instructions
         self.post_body_limit = 10 * 1024 * 1024
         self.cors_allowed_origins: Callable[[str], bool] | list[str] | str | None = self.cors_localhost
         self.tools = McpRpcRegistry()
@@ -993,7 +994,7 @@ class McpServer:
 
     def _mcp_initialize(self, protocolVersion: str, capabilities: dict, clientInfo: dict, _meta: dict | None = None) -> dict:
         """MCP initialize method"""
-        return {
+        result = {
             "protocolVersion": self.context.protocol_version or protocolVersion,
             "capabilities": {
                 "tools": {},
@@ -1008,6 +1009,9 @@ class McpServer:
                 "version": self.version,
             },
         }
+        if self.instructions is not None:
+            result["instructions"] = self.instructions
+        return result
 
     def _mcp_tools_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/list method"""

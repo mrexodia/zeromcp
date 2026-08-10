@@ -296,6 +296,32 @@ def test_tool_protocol_errors():
     print("✓ PASS")
 
 
+def test_initialize_includes_server_instructions():
+    print("Testing server instructions in initialize response...")
+    request = {
+        "jsonrpc": "2.0",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"},
+        },
+        "id": 1,
+    }
+
+    instructions = "Use the search tool before answering questions."
+    server = McpServer("instructions-test", instructions=instructions)
+    response = server._dispatch_mcp(request)
+    assert response is not None
+    assert response["result"]["instructions"] == instructions
+
+    server_without_instructions = McpServer("no-instructions-test")
+    response = server_without_instructions._dispatch_mcp(request)
+    assert response is not None
+    assert "instructions" not in response["result"]
+    print("✓ PASS")
+
+
 def test_stdio_preserves_negotiated_protocol_version():
     print("Testing stdio negotiated protocol version...")
     server = McpServer("stdio-protocol-test")
@@ -1265,6 +1291,7 @@ def run_all_tests():
         test_protocol_version_header_validation()
         test_streamable_http_protocol_defaults_and_session_reuse()
         test_tool_protocol_errors()
+        test_initialize_includes_server_instructions()
         test_stdio_preserves_negotiated_protocol_version()
         test_protocol_specific_tool_argument_errors()
         test_tool_schema_includes_future_fields_for_all_versions()

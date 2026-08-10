@@ -48,6 +48,15 @@ if __name__ == "__main__":
     mcp.serve("127.0.0.1", 8000)
 ```
 
+The optional MCP `instructions` field tells clients how the server and its features should be used. Clients may add these instructions to the model's system prompt:
+
+```python
+mcp = McpServer(
+    "my-server",
+    instructions="Use the greet tool when the user asks to greet someone.",
+)
+```
+
 Then manually test your MCP server with the [inspector](https://github.com/modelcontextprotocol/inspector):
 
 ```bash
