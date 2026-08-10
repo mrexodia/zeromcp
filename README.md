@@ -222,7 +222,7 @@ def code_review(
 MCP 2025-03-26+ supports tool behavior hints:
 
 ```python
-@mcp.tool(read_only=True, destructive=False, idempotent=True, open_world=False)
+@mcp.tool(title="Get System Status", read_only=True, destructive=False, idempotent=True, open_world=False)
 def get_status() -> dict:
     """Read current system status"""
     return {"ok": True}

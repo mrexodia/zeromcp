@@ -512,23 +512,39 @@ def test_tool_annotations():
     print("Testing tool annotations...")
     server = McpServer("annotations-test")
 
-    @server.tool(read_only=True, destructive=False, idempotent=True, open_world=False)
+    @server.tool(title="Safe Tool", read_only=True, destructive=False, idempotent=True, open_world=False)
     def safe_tool() -> str:
         return "safe"
 
-    response = server._dispatch_mcp({
+    request = {
         "jsonrpc": "2.0",
         "method": "tools/list",
         "id": 1,
-    })
-    assert response is not None
-    tool_schema = response["result"]["tools"][0]
-    assert tool_schema["annotations"] == {
+    }
+    expected_behavior_annotations = {
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
     }
+
+    with server._context_scope(protocol_version="2025-03-26"):
+        old_response = server._dispatch_mcp(request)
+    assert old_response is not None
+    old_tool_schema = old_response["result"]["tools"][0]
+    assert "title" not in old_tool_schema
+    assert old_tool_schema["annotations"] == {
+        "title": "Safe Tool",
+        **expected_behavior_annotations,
+    }
+
+    for protocol_version in ("2025-06-18", "2025-11-25"):
+        with server._context_scope(protocol_version=protocol_version):
+            response = server._dispatch_mcp(request)
+        assert response is not None
+        tool_schema = response["result"]["tools"][0]
+        assert tool_schema["title"] == "Safe Tool"
+        assert tool_schema["annotations"] == expected_behavior_annotations
     print("✓ PASS")
 
 

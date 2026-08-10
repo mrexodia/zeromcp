@@ -707,8 +707,6 @@ class McpServer:
         open_world: bool | None = None,
     ) -> Callable:
         annotations = {}
-        if title is not None:
-            annotations["title"] = title
         if read_only is not None:
             annotations["readOnlyHint"] = read_only
         if destructive is not None:
@@ -719,6 +717,8 @@ class McpServer:
             annotations["openWorldHint"] = open_world
 
         def decorator(inner: Callable) -> Callable:
+            if title is not None:
+                setattr(inner, "__mcp_tool_title__", title)
             if annotations:
                 setattr(inner, "__mcp_tool_annotations__", annotations)
             return self.tools.method(inner)
@@ -1496,7 +1496,13 @@ class McpServer:
             },
         }
 
-        annotations = getattr(func, "__mcp_tool_annotations__", None)
+        annotations = dict(getattr(func, "__mcp_tool_annotations__", None) or {})
+        title = getattr(func, "__mcp_tool_title__", None)
+        if title is not None:
+            if self._protocol_at_least("2025-06-18"):
+                schema["title"] = title
+            else:
+                annotations["title"] = title
         if annotations:
             schema["annotations"] = annotations
 
