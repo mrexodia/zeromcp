@@ -6,8 +6,9 @@ import sys
 import socket
 import zlib
 from contextlib import contextmanager
+from enum import Enum
 from types import SimpleNamespace
-from typing import BinaryIO, cast
+from typing import BinaryIO, Literal, TypedDict, cast
 from zeromcp import McpAuthInfo, McpServer, McpHttpRequestHandler
 
 def find_free_port():
@@ -354,7 +355,7 @@ def test_stdio_preserves_negotiated_protocol_version():
     assert responses[0]["result"]["protocolVersion"] == "2025-11-25"
     tool_result = responses[1]["result"]
     assert tool_result["isError"]
-    assert "missing required" in tool_result["content"][0]["text"]
+    assert "missing" in tool_result["content"][0]["text"]
     print("✓ PASS")
 
 
@@ -383,7 +384,7 @@ def test_protocol_specific_tool_argument_errors():
     assert new_response is not None
     result = new_response["result"]
     assert result["isError"] is True, "2025-11-25 treats invalid tool args as tool execution errors"
-    assert "missing required" in result["content"][0]["text"]
+    assert "missing" in result["content"][0]["text"]
     print("✓ PASS")
 
 
@@ -402,6 +403,134 @@ def test_tool_schema_includes_future_fields_for_all_versions():
             schema = server._dispatch_mcp(request)["result"]["tools"][0]
         assert schema["annotations"]["readOnlyHint"] is True
         assert schema["outputSchema"]["properties"]["result"]["type"] == "integer"
+    print("✓ PASS")
+
+
+def test_literal_fields_generate_json_schema_enums():
+    print("Testing Literal fields generate JSON Schema enums...")
+    server = McpServer("literal-schema-test")
+
+    class Backend(str, Enum):
+        GUI = "gui"
+        IDALIB = "idalib"
+
+    class Instance(TypedDict):
+        backend: Literal[Backend.GUI, Backend.IDALIB]
+        status: Literal["available", "attached", "current", "unavailable"]
+
+    class Result(TypedDict):
+        instances: list[Instance]
+
+    @server.tool
+    def list_instances(backend: Literal[Backend.GUI, Backend.IDALIB] = Backend.GUI) -> Result:
+        return {"instances": [{"backend": backend, "status": "available"}]}
+
+    response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert response is not None
+    json.dumps(response)
+    tool = response["result"]["tools"][0]
+    assert tool["inputSchema"]["properties"]["backend"] == {
+        "type": "string",
+        "enum": ["gui", "idalib"],
+        "default": "gui",
+    }
+    properties = tool["outputSchema"]["properties"]
+    instance_properties = properties["instances"]["items"]["properties"]
+    assert instance_properties["backend"] == {
+        "type": "string",
+        "enum": ["gui", "idalib"],
+    }
+    assert instance_properties["status"] == {
+        "type": "string",
+        "enum": ["available", "attached", "current", "unavailable"],
+    }
+
+    call_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "list_instances", "arguments": {"backend": "idalib"}},
+        "id": 2,
+    })
+    assert call_response is not None
+    json.dumps(call_response)
+    assert call_response["result"]["structuredContent"]["instances"][0]["backend"] == "idalib"
+    assert json.loads(call_response["result"]["content"][0]["text"])["instances"][0]["backend"] == "idalib"
+
+    # Clients enforce the advertised enum. The server passes decoded JSON through.
+    unchecked_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "list_instances", "arguments": {"backend": "unchecked"}},
+        "id": 3,
+    })
+    assert unchecked_response is not None
+    assert unchecked_response["result"]["structuredContent"]["instances"][0]["backend"] == "unchecked"
+    print("✓ PASS")
+
+
+def test_literal_enum_schema_uses_scalar_values():
+    print("Testing Literal Enum schemas use string and numeric values...")
+    server = McpServer("literal-enum-type-test")
+
+    class Label(Enum):
+        VALUE = "value"
+
+    class Count(Enum):
+        ONE = 1
+
+    class Ratio(Enum):
+        HALF = 0.5
+
+    class Unsupported(Enum):
+        VALUES = [1, 2]
+
+    assert server._type_to_json_schema(Literal[Label.VALUE]) == {
+        "type": "string",
+        "enum": ["value"],
+    }
+    assert server._type_to_json_schema(Literal[Count.ONE]) == {
+        "type": "integer",
+        "enum": [1],
+    }
+    assert server._type_to_json_schema(Literal[Ratio.HALF]) == {
+        "type": "number",
+        "enum": [0.5],
+    }
+
+    @server.tool
+    def choose(count: Literal[Count.ONE] = Count.ONE, ratio: Literal[Ratio.HALF] = Ratio.HALF) -> dict:
+        return {"count": count, "ratio": ratio}
+
+    list_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/list",
+        "id": 1,
+    })
+    assert list_response is not None
+    json.dumps(list_response)
+    properties = list_response["result"]["tools"][0]["inputSchema"]["properties"]
+    assert properties["count"] == {"type": "integer", "enum": [1], "default": 1}
+    assert properties["ratio"] == {"type": "number", "enum": [0.5], "default": 0.5}
+
+    call_response = server._dispatch_mcp({
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "choose", "arguments": {"count": 1, "ratio": 0.5}},
+        "id": 2,
+    })
+    assert call_response is not None
+    assert call_response["result"]["structuredContent"] == {"count": 1, "ratio": 0.5}
+
+    try:
+        server._type_to_json_schema(Literal[Unsupported.VALUES])
+    except TypeError as exc:
+        assert "must have a str, int, or float value" in str(exc)
+    else:
+        raise AssertionError("Expected container-valued Enum Literal to be rejected")
     print("✓ PASS")
 
 
@@ -1311,6 +1440,8 @@ def run_all_tests():
         test_stdio_preserves_negotiated_protocol_version()
         test_protocol_specific_tool_argument_errors()
         test_tool_schema_includes_future_fields_for_all_versions()
+        test_literal_fields_generate_json_schema_enums()
+        test_literal_enum_schema_uses_scalar_values()
         test_str_tool_result_is_unstructured_text()
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()

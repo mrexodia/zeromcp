@@ -13,13 +13,27 @@ import contextvars
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer, HTTPServer
-from typing import Any, Callable, Union, Annotated, BinaryIO, Mapping, NotRequired, Required, get_origin, get_args, get_type_hints, is_typeddict
+from typing import Any, Callable, Union, Annotated, BinaryIO, Literal, Mapping, NotRequired, Required, get_origin, get_args, get_type_hints, is_typeddict
 from types import UnionType
 from urllib.parse import urlparse, parse_qs
 from io import BufferedIOBase
 
 from .jsonrpc import JsonRpcRegistry, JsonRpcError, JsonRpcException, JsonRpcNoResponse, _is_async_callable
+
+
+def _literal_json_value(value: Any) -> str | int | float | bool | None:
+    """Return the JSON scalar represented by a Literal member."""
+    if isinstance(value, Enum):
+        enum_value = value.value
+        if type(enum_value) not in (str, int, float):
+            raise TypeError(f"Enum Literal member {value!r} must have a str, int, or float value")
+        return enum_value
+    if value is None or type(value) in (str, int, float, bool):
+        return value
+    raise TypeError(f"Literal member {value!r} is not a JSON scalar")
+
 
 # Deliberately not the newest supported version: older, half-compliant clients
 # are more likely to work when negotiation falls back to 2025-06-18.
@@ -624,6 +638,8 @@ class McpServer:
         self.tools = McpRpcRegistry()
         self.resources = McpRpcRegistry()
         self.prompts = McpRpcRegistry()
+        self._tool_is_async: dict[str, bool] = {}
+        self._tool_result_modes: dict[str, str] = {}
 
         self._http_server: HTTPServer | None = None
         self._server_thread: threading.Thread | None = None
@@ -721,6 +737,9 @@ class McpServer:
                 setattr(inner, "__mcp_tool_title__", title)
             if annotations:
                 setattr(inner, "__mcp_tool_annotations__", annotations)
+            name = getattr(inner, "__name__", inner.__class__.__name__)
+            self._tool_is_async[name] = _is_async_callable(inner)
+            self._tool_result_modes.pop(name, None)
             return self.tools.method(inner)
 
         return decorator if func is None else decorator(func)
@@ -1024,7 +1043,11 @@ class McpServer:
 
     def _mcp_tools_call(self, name: str, arguments: dict | None = None, _meta: dict | None = None):
         """MCP tools/call method"""
-        # Wrap tool call in JSON-RPC request so argument validation stays shared.
+        is_async = self._tool_is_async.get(name)
+        if is_async is None:
+            is_async = _is_async_callable(self.tools.methods.get(name))
+            self._tool_is_async[name] = is_async
+
         return self._dispatch_nested_mcp(
             self.tools,
             {
@@ -1035,7 +1058,7 @@ class McpServer:
             },
             lambda tool_response: self._format_tool_response(name, tool_response),
             meta=_meta,
-            cancellable=_is_async_callable(self.tools.methods.get(name)),
+            cancellable=is_async,
         )
 
     def _dispatch_nested_mcp(
@@ -1167,15 +1190,23 @@ class McpServer:
                 cancellation.cancel(reason)
 
     def _structured_content_for_tool(self, name: str, result: Any) -> dict | None:
-        func = self.tools.methods.get(name)
-        if func is not None:
-            return_type = get_type_hints(func, include_extras=True).get("return")
+        mode = self._tool_result_modes.get(name)
+        if mode is None:
+            func = self.tools.methods.get(name)
+            return_type = get_type_hints(func, include_extras=True).get("return") if func else None
             if self._type_is_plain_str(return_type):
-                return None
-            if return_type and return_type is not type(None) and return_type is not Any:
-                if not self._schema_is_object_like(self._type_to_json_schema(return_type)):
-                    return {"result": result}
-        return result if isinstance(result, dict) else {"result": result}
+                mode = "text"
+            elif return_type and return_type is not type(None) and return_type is not Any:
+                mode = "object" if self._schema_is_object_like(self._type_to_json_schema(return_type)) else "wrapped"
+            else:
+                mode = "object"
+            self._tool_result_modes[name] = mode
+
+        if mode == "text":
+            return None
+        if mode == "object" and isinstance(result, dict):
+            return result
+        return {"result": result}
 
     def _enumerate_resources(self):
         for name, func in self.resources.methods.items():
@@ -1364,6 +1395,17 @@ class McpServer:
         if origin in (Required, NotRequired):
             return self._type_to_json_schema(get_args(py_type)[0])
 
+        # Literal[value, ...]
+        if origin is Literal:
+            values = [_literal_json_value(value) for value in get_args(py_type)]
+            schema: dict[str, Any] = {"enum": values}
+            value_types = {type(value) for value in values}
+            if len(value_types) == 1:
+                value_schema = self._type_to_json_schema(next(iter(value_types)))
+                if value_schema.get("type") != "object":
+                    schema = {**value_schema, **schema}
+            return schema
+
         # Union[Ts..], Optional[T] and T1 | T2
         if origin in (Union, UnionType):
             return {"anyOf": [self._type_to_json_schema(t) for t in get_args(py_type)]}
@@ -1480,11 +1522,16 @@ class McpServer:
                 required.append(param_name)
             else:
                 try:
-                    json.dumps(param.default)
+                    default = (
+                        _literal_json_value(param.default)
+                        if isinstance(param.default, Enum)
+                        else param.default
+                    )
+                    json.dumps(default)
                 except TypeError:
                     pass
                 else:
-                    properties[param_name]["default"] = param.default
+                    properties[param_name]["default"] = default
 
         schema: dict[str, Any] = {
             "name": func_name,

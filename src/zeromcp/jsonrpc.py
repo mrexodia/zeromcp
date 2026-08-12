@@ -3,8 +3,8 @@ import contextvars
 import inspect
 import json
 import traceback
-from typing import Any, Callable, get_type_hints, get_origin, get_args, Union, TypedDict, TypeAlias, NotRequired, is_typeddict
-from types import UnionType
+from typing import Any, Callable, TypedDict, TypeAlias, NotRequired
+
 
 
 def _is_async_callable(func: Callable | None) -> bool:
@@ -45,7 +45,6 @@ class JsonRpcNoResponse(Exception):
 class JsonRpcRegistry:
     def __init__(self):
         self.methods: dict[str, Callable] = {}
-        self._cache: dict[Callable, tuple[inspect.Signature, dict, list[str]]] = {}
         self._current_request: contextvars.ContextVar[JsonRpcId] = contextvars.ContextVar("zeromcp_current_request_id", default=None)
         self._async_dispatch: contextvars.ContextVar[bool] = contextvars.ContextVar("zeromcp_async_dispatch", default=False)
         self.redact_exceptions = False
@@ -181,155 +180,34 @@ class JsonRpcRegistry:
         }
 
     def _call(self, method: str, params: Any) -> Any:
-        if method not in self.methods:
-            raise JsonRpcException(-32601, f"Method '{method}' not found")
+        try:
+            func = self.methods[method]
+        except KeyError:
+            raise JsonRpcException(-32601, f"Method '{method}' not found") from None
 
-        func = self.methods[method]
-
-        # Check for cached reflection data
-        if func not in self._cache:
-            sig = inspect.signature(func)
-            hints = get_type_hints(func)
-            hints.pop("return", None)
-
-            # Determine required vs optional parameters
-            required_params = []
-            for param_name, param in sig.parameters.items():
-                if param.default is inspect.Parameter.empty:
-                    required_params.append(param_name)
-
-            self._cache[func] = (sig, hints, required_params)
-
-        sig, hints, required_params = self._cache[func]
-
-        # Handle None params
         if params is None:
-            if len(required_params) == 0:
-                return func()
-            else:
-                raise JsonRpcException(-32602, "Missing required params")
-
-        # Convert list params to dict by parameter names
-        if isinstance(params, list):
-            if len(params) < len(required_params):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: expected at least {len(required_params)} arguments, got {len(params)}"
-                )
-            if len(params) > len(sig.parameters):
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: expected at most {len(sig.parameters)} arguments, got {len(params)}"
-                )
-            params = dict(zip(sig.parameters.keys(), params))
-
-        # Validate dict params
-        if isinstance(params, dict):
-            # Check all required params are present
-            missing = set(required_params) - set(params.keys())
-            if missing:
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: missing required parameters: {list(missing)}"
-                )
-
-            # Check no extra params
-            extra = set(params.keys()) - set(sig.parameters.keys())
-            if extra:
-                raise JsonRpcException(
-                    -32602,
-                    f"Invalid params: unexpected parameters: {list(extra)}"
-                )
-
-            validated_params = {}
-            for param_name, value in params.items():
-                # If no type hint, pass through without validation
-                if param_name not in hints:
-                    validated_params[param_name] = value
-                    continue
-
-                # Has type hint, validate
-                expected_type = hints[param_name]
-
-                # Inline type validation
-                origin = get_origin(expected_type)
-                args = get_args(expected_type)
-
-                # Handle None/null
-                if value is None:
-                    if expected_type is not type(None):
-                        # Check if None is allowed in a Union
-                        if not (origin in (Union, UnionType) and type(None) in args):
-                            raise JsonRpcException(-32602, f"Invalid params: {param_name} cannot be null")
-                    validated_params[param_name] = None
-                    continue
-
-                # Handle Union types (int | str, Optional[int], etc.)
-                if origin in (Union, UnionType):
-                    type_matched = False
-                    for arg_type in args:
-                        if arg_type is type(None):
-                            continue
-
-                        arg_origin = get_origin(arg_type)
-                        check_type = arg_origin if arg_origin is not None else arg_type
-
-                        # TypedDict cannot be used with isinstance - check for dict instead
-                        if is_typeddict(arg_type):
-                            check_type = dict
-
-                        if isinstance(value, check_type):
-                            type_matched = True
-                            break
-
-                    if not type_matched:
-                        raise JsonRpcException(-32602, f"Invalid params: {param_name} union does not contain {type(value).__name__}")
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle generic types (list[X], dict[K,V])
-                if origin is not None:
-                    if not isinstance(value, origin):
-                        raise JsonRpcException(
-                            -32602,
-                            f"Invalid params: {param_name} expected {origin.__name__}, got {type(value).__name__}"
-                        )
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle TypedDict (must check before basic types)
-                if is_typeddict(expected_type):
-                    if not isinstance(value, dict):
-                        raise JsonRpcException(
-                            -32602,
-                            f"Invalid params: {param_name} expected dict, got {type(value).__name__}"
-                        )
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle Any
-                if expected_type is Any:
-                    validated_params[param_name] = value
-                    continue
-
-                # Handle basic types
-                if isinstance(expected_type, type):
-                    # Allow int -> float conversion
-                    if expected_type is float and isinstance(value, int):
-                        validated_params[param_name] = float(value)
-                        continue
-                    if not isinstance(value, expected_type):
-                        raise JsonRpcException(
-                            -32602,
-                            f"Invalid params: {param_name} expected {expected_type.__name__}, got {type(value).__name__}"
-                        )
-                    validated_params[param_name] = value
-                    continue
-
-            return func(**validated_params)
-
+            args, kwargs = (), {}
+        elif isinstance(params, list):
+            args, kwargs = params, {}
+        elif isinstance(params, dict):
+            args, kwargs = (), params
         else:
             raise JsonRpcException(-32602, "Invalid params: must be array or object")
+
+        try:
+            return func(*args, **kwargs)
+        except TypeError:
+            # Only inspect the signature on the error path. This distinguishes bad
+            # arguments from a TypeError raised inside the function.
+            try:
+                signature = inspect.signature(func)
+            except (TypeError, ValueError):
+                raise
+            try:
+                signature.bind(*args, **kwargs)
+            except TypeError as exc:
+                raise JsonRpcException(-32602, f"Invalid params: {exc}") from None
+            raise
 
     def _error(self, request_id: JsonRpcId, code: int, message: str, data: Any = None) -> JsonRpcResponse:
         error: JsonRpcError = {
