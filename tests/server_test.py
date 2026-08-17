@@ -1,4 +1,5 @@
 import gzip
+import http.client
 import io
 import json
 import requests
@@ -8,6 +9,7 @@ import zlib
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import BinaryIO, cast
+from urllib.parse import urlparse
 from zeromcp import McpAuthInfo, McpServer, McpHttpRequestHandler
 
 def find_free_port():
@@ -29,6 +31,51 @@ def run_server(name="test", **kwargs):
         server.stop()
 
 PING_JSON = {"jsonrpc": "2.0", "method": "ping", "id": 1}
+
+
+def read_until(sock, marker=b"\r\n\r\n", timeout=2):
+    """Read from sock until marker is seen (inclusive); a single recv() can
+    return a partial message, so callers must not assume one recv() == one response."""
+    sock.settimeout(timeout)
+    buf = b""
+    while marker not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def read_http_response(sock, timeout=2):
+    """Read one full HTTP response (status line + headers + Content-Length body) off sock."""
+    buf = read_until(sock, timeout=timeout)
+    header_part, _, rest = buf.partition(b"\r\n\r\n")
+    lines = header_part.split(b"\r\n")
+    status_line = lines[0] if lines else b""
+    headers = {}
+    for line in lines[1:]:
+        if b":" in line:
+            key, _, value = line.partition(b":")
+            headers[key.strip().lower()] = value.strip()
+    content_length = headers.get(b"content-length")
+    if content_length is not None:
+        need = int(content_length)
+        sock.settimeout(timeout)
+        while len(rest) < need:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            rest += chunk
+    return status_line, headers, rest
+
+
+def make_headers(**kwargs):
+    """Build a real HTTPMessage (the type self.headers has on a live handler)
+    so get_all()-based framing checks behave the same as they would over the wire."""
+    message = http.client.HTTPMessage()
+    for name, value in kwargs.items():
+        message.add_header(name, value)
+    return message
 
 
 def test_streamable_http_session_id():
@@ -1113,6 +1160,28 @@ def test_body_limit():
     print("✓ PASS")
 
 
+
+
+def test_non_decimal_content_length_rejected():
+    print("Testing non-decimal Content-Length rejection...")
+    for value in ("+5", "-0"):
+        handler = object.__new__(McpHttpRequestHandler)
+        handler.mcp_server = SimpleNamespace(post_body_limit=10)
+        handler.headers = make_headers(**{"Content-Length": value})
+        handler.rfile = io.BytesIO(b"abcde")
+        handler.close_connection = False
+        errors = []
+        handler.send_error = lambda code, message=None, explain=None: errors.append(
+            (code, message)
+        )
+
+        assert handler._read_body() is None
+        assert handler.close_connection is True
+        assert errors == [(400, "Invalid Content-Length")]
+        assert handler.rfile.tell() == 0, "invalid framing must be rejected before reading"
+    print("✓ PASS")
+
+
 def test_compressed_body_limit():
     print("Testing compressed body limit...")
     with run_server(post_body_limit=100) as (base_url, _):
@@ -1137,6 +1206,10 @@ def test_concatenated_gzip_body_limit():
         resp = requests.post(f"{base_url}/mcp", headers=headers, data=first_member + second_member)
         assert resp.status_code == 413, "Concatenated gzip members should count against decompressed limit"
         assert "Payload Too Large" in resp.text, "Error message should mention payload size"
+
+        truncated = gzip.compress(json.dumps(PING_JSON).encode("utf-8"))[:-5]
+        resp = requests.post(f"{base_url}/mcp", headers=headers, data=truncated)
+        assert resp.status_code == 400, "Truncated gzip data should be rejected"
     print("✓ PASS")
 
 
@@ -1144,7 +1217,7 @@ def test_content_length_overlimit_closes_connection():
     print("Testing Content-Length overlimit connection close...")
     handler = object.__new__(McpHttpRequestHandler)
     handler.mcp_server = SimpleNamespace(post_body_limit=5)
-    handler.headers = {"Content-Length": "10"}
+    handler.headers = make_headers(**{"Content-Length": "10"})
     handler.rfile = io.BytesIO(b"abcdefghijGET /mcp HTTP/1.1\r\n\r\n")
     handler.close_connection = False
     errors = []
@@ -1163,7 +1236,7 @@ def test_chunked_overlimit_closes_connection():
     print("Testing chunked overlimit connection close...")
     handler = object.__new__(McpHttpRequestHandler)
     handler.mcp_server = SimpleNamespace(post_body_limit=5)
-    handler.headers = {"Transfer-Encoding": "chunked"}
+    handler.headers = make_headers(**{"Transfer-Encoding": "chunked"})
     handler.rfile = io.BytesIO(b"a\r\nabcdefghij\r\n0\r\n\r\nGET /mcp HTTP/1.1\r\n\r\n")
     handler.close_connection = False
     errors = []
@@ -1175,6 +1248,252 @@ def test_chunked_overlimit_closes_connection():
     assert handler.close_connection is True, "Over-limit chunked body should close the connection"
     assert errors and errors[0][0] == 413, "Over-limit chunked body should send 413"
     assert handler.rfile.read().startswith(b"abcdefghij"), "Over-limit chunked body should not need draining"
+    print("✓ PASS")
+
+
+def test_http11_keep_alive_reuses_connection():
+    print("Testing HTTP/1.1 keep-alive connection reuse...")
+    with run_server() as (base_url, _):
+        parsed = urlparse(base_url)
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=2)
+        try:
+            body = json.dumps(PING_JSON).encode("utf-8")
+            request = (
+                f"POST /mcp HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+            ).encode("utf-8") + body
+
+            sock.sendall(request)
+            status1, _, _ = read_http_response(sock)
+            assert status1.startswith(b"HTTP/1.1 200"), f"expected HTTP/1.1 200, got {status1!r}"
+
+            # A second request only succeeds on this same socket if the first
+            # response's Content-Length let the client find exactly where it ends.
+            sock.sendall(request)
+            status2, _, _ = read_http_response(sock)
+            assert status2.startswith(b"HTTP/1.1 200"), f"second request on reused connection failed: {status2!r}"
+        finally:
+            sock.close()
+    print("✓ PASS")
+
+
+def test_http_error_closes_connection():
+    print("Testing HTTP error responses close the connection...")
+    with run_server() as (base_url, _):
+        parsed = urlparse(base_url)
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=2)
+        try:
+            sock.sendall(f"GET /nope HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n\r\n".encode())
+            status, headers, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 404"), status
+            assert headers.get(b"connection") == b"close"
+
+            sock.settimeout(1)
+            try:
+                more = sock.recv(4096)
+            except socket.timeout:
+                raise AssertionError("connection should have closed after an error response")
+            assert more == b"", "connection should have closed after an error response"
+        finally:
+            sock.close()
+    print("✓ PASS")
+
+
+def test_conflicting_request_framing_rejected():
+    print("Testing conflicting Content-Length/Transfer-Encoding is rejected...")
+    with run_server() as (base_url, _):
+        parsed = urlparse(base_url)
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=2)
+        try:
+            request = (
+                f"POST /mcp HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+                f"Content-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ).encode() + b"2\r\n{}\r\n0\r\n\r\n"
+            sock.sendall(request)
+            status, _, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 400"), status
+        finally:
+            sock.close()
+    print("✓ PASS")
+
+
+def test_unexpected_body_rejected_on_bodiless_methods():
+    print("Testing GET/OPTIONS/DELETE reject an unexpected body...")
+    with run_server() as (base_url, _):
+        for method in ("GET", "OPTIONS", "DELETE"):
+            resp = requests.request(method, f"{base_url}/mcp", data=b"abc")
+            assert resp.status_code == 400, f"{method} with a body should be rejected, got {resp.status_code}"
+            assert "Request body is not allowed" in resp.text
+    print("✓ PASS")
+
+
+def test_options_preflight_has_content_length():
+    print("Testing OPTIONS preflight response has an explicit Content-Length...")
+    with run_server() as (base_url, _):
+        resp = requests.options(f"{base_url}/mcp")
+        assert resp.status_code == 200
+        assert resp.headers.get("Content-Length") == "0"
+    print("✓ PASS")
+
+
+def test_expect_100_continue_denied_before_auth():
+    print("Testing Expect: 100-continue is gated by auth before accepting a body...")
+    port = find_free_port()
+    server = McpServer("expect-100-test")
+    verified_tokens = []
+
+    @server.oauth(
+        resource="http://resource.example/mcp",
+        authorization_servers=["https://auth.example"],
+        required_scopes=["mcp"],
+    )
+    def verify_token(token: str, resource: str) -> McpAuthInfo | None:
+        verified_tokens.append(token)
+        return McpAuthInfo(subject="alice", scopes=frozenset({"mcp"})) if token == "good-token" else None
+
+    server.serve("127.0.0.1", port, background=True)
+    try:
+        body = json.dumps(PING_JSON).encode("utf-8")
+
+        # Deterministically invalid framing must receive the final response,
+        # not an interim 100 that invites an upload the server will reject.
+        invalid_framings = (
+            (
+                f"Content-Length: {server.post_body_limit + 1}\r\n",
+                b"HTTP/1.1 413",
+            ),
+            (
+                "Content-Length: 2\r\nTransfer-Encoding: chunked\r\n",
+                b"HTTP/1.1 400",
+            ),
+        )
+        for framing_headers, expected_status in invalid_framings:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+            try:
+                sock.sendall(
+                    (
+                        f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                        "Authorization: Bearer good-token\r\n"
+                        f"{framing_headers}Expect: 100-continue\r\n\r\n"
+                    ).encode()
+                )
+                status, _, _ = read_http_response(sock)
+                assert status.startswith(expected_status), status
+            finally:
+                sock.close()
+        assert verified_tokens == [], "invalid framing should be rejected before OAuth"
+
+        # Unauthorized: must be rejected directly, never inviting the body upload.
+        sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+        try:
+            sock.sendall(
+                (
+                    f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                    f"Content-Length: {len(body)}\r\nExpect: 100-continue\r\n\r\n"
+                ).encode()
+            )
+            status, _, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 401"), (
+                f"unauthorized Expect:100-continue should be rejected directly, got {status!r}"
+            )
+        finally:
+            sock.close()
+
+        # Authorized: gets "100 Continue" first, then the real response after the body.
+        sock = socket.create_connection(("127.0.0.1", port), timeout=2)
+        try:
+            sock.sendall(
+                (
+                    f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                    f"Authorization: Bearer good-token\r\n"
+                    f"Content-Length: {len(body)}\r\nExpect: 100-continue\r\n\r\n"
+                ).encode()
+            )
+            interim = read_until(sock)
+            assert interim.startswith(b"HTTP/1.1 100"), (
+                f"authorized Expect:100-continue should get 100 Continue, got {interim[:60]!r}"
+            )
+            sock.sendall(body)
+            status, _, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 200"), status
+            assert verified_tokens == ["good-token"], "Expect authentication should be reused"
+        finally:
+            sock.close()
+    finally:
+        server.stop()
+    print("✓ PASS")
+
+
+def test_http11_requires_exactly_one_host():
+    print("Testing HTTP/1.1 Host validation...")
+    with run_server() as (base_url, _):
+        parsed = urlparse(base_url)
+        body = json.dumps(PING_JSON).encode("utf-8")
+        suffix = (
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+        ).encode() + body
+        for headers in (
+            b"",
+            f"Host: {parsed.hostname}:{parsed.port}\r\nHost: evil.example\r\n".encode(),
+        ):
+            sock = socket.create_connection((parsed.hostname, parsed.port), timeout=2)
+            try:
+                sock.sendall(b"POST /mcp HTTP/1.1\r\n" + headers + suffix)
+                status, _, _ = read_http_response(sock)
+                assert status.startswith(b"HTTP/1.1 400"), status
+            finally:
+                sock.close()
+
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=2)
+        try:
+            sock.sendall(b"POST /mcp HTTP/1.0\r\n" + suffix)
+            status, _, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 200"), status
+        finally:
+            sock.close()
+    print("✓ PASS")
+
+
+def test_malformed_chunk_trailer_rejected():
+    print("Testing malformed chunk trailer rejection...")
+    with run_server() as (base_url, _):
+        parsed = urlparse(base_url)
+        body = json.dumps(PING_JSON).encode("utf-8")
+        request = (
+            f"POST /mcp HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+            "Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+        ).encode()
+        request += f"{len(body):X}\r\n".encode() + body + b"\r\n0\r\n \r\n\r\n"
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=2)
+        try:
+            sock.sendall(request)
+            status, _, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 400"), status
+        finally:
+            sock.close()
+    print("✓ PASS")
+
+
+def test_stop_closes_idle_keep_alive_connection():
+    print("Testing server stop closes idle keep-alive connections...")
+    with run_server() as (base_url, server):
+        parsed = urlparse(base_url)
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=2)
+        try:
+            body = json.dumps(PING_JSON).encode("utf-8")
+            request = (
+                f"POST /mcp HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+            sock.sendall(request)
+            status, _, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 200"), status
+
+            server.stop()
+            sock.settimeout(1)
+            assert sock.recv(1) == b"", "accepted connection remained usable after stop()"
+        finally:
+            sock.close()
     print("✓ PASS")
 
 
@@ -1333,9 +1652,19 @@ def run_all_tests():
         test_cors_list()
         test_body_limit()
         test_content_length_overlimit_closes_connection()
+        test_non_decimal_content_length_rejected()
         test_compressed_body_limit()
         test_concatenated_gzip_body_limit()
         test_chunked_overlimit_closes_connection()
+        test_http11_keep_alive_reuses_connection()
+        test_http_error_closes_connection()
+        test_conflicting_request_framing_rejected()
+        test_unexpected_body_rejected_on_bodiless_methods()
+        test_options_preflight_has_content_length()
+        test_expect_100_continue_denied_before_auth()
+        test_http11_requires_exactly_one_host()
+        test_malformed_chunk_trailer_rejected()
+        test_stop_closes_idle_keep_alive_connection()
         test_exception_redaction()
         test_exception_exposure()
         test_http_errors()
