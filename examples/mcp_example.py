@@ -156,7 +156,7 @@ def summarize(
     return f"Summarize the following in {max_sentences} sentences or fewer:\n\n{text}"
 
 
-def infer_oauth_resource(transport: str) -> str:
+def infer_oauth_resource(transport: str, path_prefix: str = "") -> str:
     url = urlparse(transport)
     if url.hostname is None or url.port is None:
         raise Exception(f"Invalid transport URL: {transport}")
@@ -168,7 +168,8 @@ def infer_oauth_resource(transport: str) -> str:
         host = "::1"
 
     netloc = f"[{host}]:{url.port}" if ":" in host else f"{host}:{url.port}"
-    return f"{url.scheme}://{netloc}/mcp"
+    prefix = path_prefix.rstrip("/")
+    return f"{url.scheme}://{netloc}{prefix}/mcp"
 
 
 def _b64url_decode(data: str) -> bytes:
@@ -264,6 +265,11 @@ if __name__ == "__main__":
         default="http://127.0.0.1:5001",
     )
     parser.add_argument(
+        "--path-prefix",
+        default="",
+        help="URL path prefix for HTTP endpoints (for example, /hex-rays).",
+    )
+    parser.add_argument(
         "--cors-origin",
         action="append",
         dest="cors_origins",
@@ -325,7 +331,7 @@ if __name__ == "__main__":
         oauth_authorization_servers = None
         oauth_scopes = None
         if args.oauth:
-            oauth_resource = args.oauth_resource or infer_oauth_resource(args.transport)
+            oauth_resource = args.oauth_resource or infer_oauth_resource(args.transport, args.path_prefix)
             oauth_authorization_servers = args.oauth_authorization_servers or ["https://auth.example.com"]
             oauth_scopes = args.oauth_scopes or ["mcp"]
             configure_oauth(
@@ -367,7 +373,7 @@ if __name__ == "__main__":
             print(f"  - {name}: {func.__doc__}")
         print()
 
-        mcp.serve(url.hostname, url.port)
+        mcp.serve(url.hostname, url.port, path_prefix=args.path_prefix)
 
         try:
             input("\nServer is running, press Enter or Ctrl+C to stop...")

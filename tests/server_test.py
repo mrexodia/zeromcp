@@ -18,12 +18,12 @@ def find_free_port():
         return s.getsockname()[1]
 
 @contextmanager
-def run_server(name="test", **kwargs):
+def run_server(name="test", path_prefix="", **kwargs):
     port = find_free_port()
     server = McpServer(name)
     for k, v in kwargs.items():
         setattr(server, k, v)
-    server.serve("127.0.0.1", port, background=True)
+    server.serve("127.0.0.1", port, background=True, path_prefix=path_prefix)
     base_url = f"http://127.0.0.1:{port}"
     try:
         yield base_url, server
@@ -31,6 +31,36 @@ def run_server(name="test", **kwargs):
         server.stop()
 
 PING_JSON = {"jsonrpc": "2.0", "method": "ping", "id": 1}
+
+
+def test_http_path_prefix():
+    print("Testing HTTP path prefix...")
+    with run_server(path_prefix="/hex-rays/") as (base_url, server):
+        assert server.path_prefix == "/hex-rays"
+
+        resp = requests.post(f"{base_url}/hex-rays/mcp", json=PING_JSON)
+        assert resp.status_code == 200
+        assert resp.json()["result"] == {}
+
+        assert requests.post(f"{base_url}/mcp", json=PING_JSON).status_code == 404
+        assert requests.get(f"{base_url}/sse").status_code == 404
+
+        sse = requests.get(f"{base_url}/hex-rays/sse", stream=True, timeout=2)
+        try:
+            assert sse.raw.readline() == b"event: endpoint\n"
+            endpoint = sse.raw.readline().decode("utf-8")
+            assert endpoint.startswith("data: /hex-rays/sse?session=")
+        finally:
+            sse.close()
+
+    server = McpServer("invalid-prefix")
+    try:
+        server.serve("127.0.0.1", find_free_port(), path_prefix="hex-rays")
+        raise AssertionError("a relative path prefix should be rejected")
+    except ValueError:
+        pass
+    assert server._http_server is None
+    print("✓ PASS")
 
 
 def read_until(sock, marker=b"\r\n\r\n", timeout=2):
@@ -1617,6 +1647,7 @@ def run_all_tests():
     print("="*60)
 
     try:
+        test_http_path_prefix()
         test_streamable_http_session_id()
         test_streamable_http_notifications_have_no_body()
         test_streamable_http_session_id_is_server_generated()

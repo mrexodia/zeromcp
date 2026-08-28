@@ -158,6 +158,17 @@ def _is_loopback_host(host: str) -> bool:
     except ValueError:
         return host.lower() == "localhost"
 
+def _normalize_path_prefix(path_prefix: str) -> str:
+    if not isinstance(path_prefix, str):
+        raise TypeError("path_prefix must be a string")
+    if not path_prefix or path_prefix == "/":
+        return ""
+    if not path_prefix.startswith("/"):
+        raise ValueError("path_prefix must start with '/'")
+    if "?" in path_prefix or "#" in path_prefix:
+        raise ValueError("path_prefix must not contain a query or fragment")
+    return path_prefix.rstrip("/")
+
 def _host_header_allowed_for_bind(bound_host: str, host_header: str | None) -> bool:
     if host_header is None:
         return True
@@ -250,8 +261,16 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _transport_path(self, path: str) -> str | None:
+        prefix = self.mcp_server.path_prefix
+        if prefix:
+            if not path.startswith(f"{prefix}/"):
+                return None
+            path = path[len(prefix):]
+        return path if path in ("/sse", "/mcp") else None
+
     def _check_oauth_for_path(self, path: str) -> tuple[bool, McpAuthInfo | None]:
-        if path not in ("/sse", "/mcp"):
+        if self._transport_path(path) is None:
             return True, None
         return self._check_oauth()
 
@@ -439,7 +458,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         if not ok:
             return
 
-        match path:
+        match self._transport_path(path):
             case "/sse":
                 self._handle_sse_get(auth_info)
             case "/mcp":
@@ -465,7 +484,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         if body is None:
             return
 
-        match path:
+        match self._transport_path(path):
             case "/sse":
                 self._handle_sse_post(body, auth_info)
             case "/mcp":
@@ -495,7 +514,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         ok, _ = self._check_oauth_for_path(path)
         if not ok:
             return
-        if path != "/mcp":
+        if self._transport_path(path) != "/mcp":
             self.send_error(405, "Method Not Allowed")
             return
 
@@ -669,7 +688,7 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             # Send endpoint event with session ID for routing
-            conn.send_event("endpoint", f"/sse?session={conn.session_id}")
+            conn.send_event("endpoint", f"{self.mcp_server.path_prefix}/sse?session={conn.session_id}")
 
             # Keep connection alive with periodic pings
             last_ping = time.time()
@@ -823,6 +842,7 @@ class McpServer:
         self.name = name
         self.version = version
         self.instructions = instructions
+        self.path_prefix = ""
         self.post_body_limit = 10 * 1024 * 1024
         self.cors_allowed_origins: Callable[[str], bool] | list[str] | str | None = self.cors_localhost
         self.tools = McpRpcRegistry()
@@ -963,10 +983,20 @@ class McpServer:
             return self.resources.method(func)
         return decorator
 
-    def serve(self, host: str, port: int, *, background = True, request_handler = McpHttpRequestHandler):
+    def serve(
+        self,
+        host: str,
+        port: int,
+        *,
+        background = True,
+        request_handler = McpHttpRequestHandler,
+        path_prefix: str = "",
+    ):
         if self._running:
             print("[MCP] Server is already running")
             return
+
+        self.path_prefix = _normalize_path_prefix(path_prefix)
 
         # Create server with deferred binding
         assert issubclass(request_handler, McpHttpRequestHandler)
@@ -992,8 +1022,8 @@ class McpServer:
         self._running = True
 
         print("[MCP] Server started:")
-        print(f"  Streamable HTTP: http://{host}:{port}/mcp")
-        print(f"  SSE: http://{host}:{port}/sse")
+        print(f"  Streamable HTTP: http://{host}:{port}{self.path_prefix}/mcp")
+        print(f"  SSE: http://{host}:{port}{self.path_prefix}/sse")
 
         def serve_forever():
             try:
