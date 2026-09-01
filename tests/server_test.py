@@ -435,6 +435,68 @@ def test_stdio_preserves_negotiated_protocol_version():
     print("✓ PASS")
 
 
+def test_stdio_logging_notifications():
+    print("Testing stdio logging notifications...")
+    server = McpServer("stdio-logging-test")
+
+    @server.tool
+    def report() -> str:
+        server.send_log_message("info", "filtered")
+        server.send_log_message("error", {"status": "failed"}, logger="test.report")
+        return "reported"
+
+    requests = [
+        {
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"},
+            },
+            "id": 1,
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "logging/setLevel",
+            "params": {"level": "warning"},
+            "id": 2,
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": "report", "arguments": {}},
+            "id": 3,
+        },
+    ]
+    stdin = io.BytesIO(b"".join(json.dumps(request).encode() + b"\n" for request in requests))
+    stdout = io.BytesIO()
+    server.stdio(stdin, stdout)
+    messages = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+    assert messages[0]["result"]["capabilities"]["logging"] == {}
+    assert messages[1] == {"jsonrpc": "2.0", "result": {}, "id": 2}
+    assert messages[2] == {
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {
+            "level": "error",
+            "data": {"status": "failed"},
+            "logger": "test.report",
+        },
+    }
+    assert messages[3]["id"] == 3
+    assert messages[3]["result"]["content"][0]["text"] == "reported"
+    assert len(messages) == 4, "messages below the client-selected level must be filtered"
+
+    try:
+        server.send_log_message("info", "too late")
+        raise AssertionError("sending without an active stdio transport should fail")
+    except RuntimeError:
+        pass
+    print("✓ PASS")
+
+
 def test_protocol_specific_tool_argument_errors():
     print("Testing protocol-specific tool argument errors...")
     server = McpServer("tool-error-test")

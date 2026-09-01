@@ -244,6 +244,29 @@ def inspect_request() -> dict:
 
 `mcp.context.meta` contains the request `_meta` object, including fields such as `progressToken`.
 
+## Logging notifications (stdio)
+
+Stdio servers can send MCP `notifications/message` logging notifications while
+the transport is running:
+
+```python
+@mcp.tool
+def rebuild_index() -> str:
+    mcp.send_log_message("info", "Rebuilding the index", logger="search")
+    # ...
+    mcp.send_log_message("notice", {"indexed": 42}, logger="search")
+    return "done"
+```
+
+The stdio server advertises the MCP `logging` capability and handles
+`logging/setLevel`. Messages below the client-selected level are omitted; the
+default level is `info`. Supported levels are `debug`, `info`, `notice`,
+`warning`, `error`, `critical`, `alert`, and `emergency`.
+
+`send_log_message` is safe to call from concurrent handlers or background
+threads, but raises `RuntimeError` when no stdio transport is active. Streamable
+HTTP logging notifications are not currently supported.
+
 ## Async tools
 
 Async tools, resources, prompts, and JSON-RPC methods are supported. HTTP and stdio transports stay synchronous by default; async stdio concurrency is opt-in with `await mcp.stdio_async()`.

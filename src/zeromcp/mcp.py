@@ -33,6 +33,7 @@ SUPPORTED_PROTOCOL_VERSIONS = STREAMABLE_HTTP_PROTOCOL_VERSIONS | {LEGACY_SSE_PR
 _HTTP_TOKEN_BYTES = b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _MAX_CHUNK_LINE = 8192
 _MAX_TRAILER_BYTES = 64 * 1024
+_LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
 
 @dataclass(frozen=True)
 class McpAuthInfo:
@@ -862,6 +863,9 @@ class McpServer:
         self._http_connections_lock = threading.Lock()
         self.max_http_sessions = 1024
         self._stdio_protocol_version: str | None = None
+        self._stdio_stdout: BinaryIO | None = None
+        self._stdio_write_lock = threading.Lock()
+        self._stdio_log_level = "info"
         self._pending_requests: dict[tuple[str | None, int | str], _McpCancellation] = {}
         self._pending_requests_lock = threading.Lock()
         self._context_var: contextvars.ContextVar[McpRequestContext] = contextvars.ContextVar(
@@ -882,6 +886,7 @@ class McpServer:
         self.registry.method(self._mcp_resources_read, "resources/read")
         self.registry.method(self._mcp_prompts_list, "prompts/list")
         self.registry.method(self._mcp_prompts_get, "prompts/get")
+        self.registry.method(self._mcp_logging_set_level, "logging/setLevel")
         self.registry.method(self._mcp_notifications_initialized, "notifications/initialized")
         self.registry.method(self._mcp_notifications_cancelled, "notifications/cancelled")
 
@@ -1066,48 +1071,85 @@ class McpServer:
 
         print("[MCP] Server stopped")
 
+    @contextmanager
+    def _stdio_output_scope(self, stdout: BinaryIO):
+        with self._stdio_write_lock:
+            if self._stdio_stdout is not None:
+                raise RuntimeError("stdio transport is already running")
+            self._stdio_stdout = stdout
+            self._stdio_log_level = "info"
+        try:
+            yield
+        finally:
+            with self._stdio_write_lock:
+                if self._stdio_stdout is stdout:
+                    self._stdio_stdout = None
+
+    def _write_stdio_message(self, message: Mapping[str, Any]) -> None:
+        encoded = json.dumps(message).encode("utf-8") + b"\n"
+        with self._stdio_write_lock:
+            if self._stdio_stdout is None:
+                raise RuntimeError("notifications/message requires an active stdio transport")
+            self._stdio_stdout.write(encoded)
+            self._stdio_stdout.flush()
+
+    def send_log_message(self, level: str, data: Any, logger: str | None = None) -> None:
+        """Send an MCP notifications/message logging notification over stdio."""
+        if level not in _LOG_LEVELS:
+            raise ValueError(f"unsupported MCP logging level: {level}")
+
+        params = {"level": level, "data": data}
+        if logger is not None:
+            params["logger"] = logger
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": params,
+        }
+
+        encoded = json.dumps(notification).encode("utf-8") + b"\n"
+        with self._stdio_write_lock:
+            if self._stdio_stdout is None:
+                raise RuntimeError("notifications/message requires an active stdio transport")
+            if _LOG_LEVELS.index(level) < _LOG_LEVELS.index(self._stdio_log_level):
+                return
+            self._stdio_stdout.write(encoded)
+            self._stdio_stdout.flush()
+
     def stdio(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
         stdout = stdout or sys.stdout.buffer
-        while True:
-            try:
-                request = stdin.readline()
-                if not request:  # EOF
+        with self._stdio_output_scope(stdout):
+            while True:
+                try:
+                    request = stdin.readline()
+                    if not request:  # EOF
+                        break
+
+                    # Strip whitespace (trailing newline) before parsing
+                    request = request.strip()
+                    if not request:
+                        continue
+
+                    request_id = self._request_id_from_body(request)
+                    request_method, active_protocol_version = self._stdio_request_protocol(request)
+                    with self._context_scope(
+                        request_id=request_id,
+                        protocol_version=active_protocol_version,
+                        transport_session_id="stdio:default",
+                    ):
+                        response = self._dispatch_mcp(request)
+                    if request_method == "initialize" and response is not None and "error" not in response:
+                        self._stdio_protocol_version = active_protocol_version
+                    if response is not None:
+                        self._write_stdio_message(response)
+                except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
                     break
-
-                # Strip whitespace (trailing newline) before parsing
-                request = request.strip()
-                if not request:
-                    continue
-
-                request_id = self._request_id_from_body(request)
-                request_method, active_protocol_version = self._stdio_request_protocol(request)
-                with self._context_scope(
-                    request_id=request_id,
-                    protocol_version=active_protocol_version,
-                    transport_session_id="stdio:default",
-                ):
-                    response = self._dispatch_mcp(request)
-                if request_method == "initialize" and response is not None and "error" not in response:
-                    self._stdio_protocol_version = active_protocol_version
-                if response is not None:
-                    stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                    stdout.flush()
-            except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
-                break
 
     async def stdio_async(self, stdin: BinaryIO | None = None, stdout: BinaryIO | None = None):
         stdin = stdin or sys.stdin.buffer
         stdout = stdout or sys.stdout.buffer
-        write_lock = asyncio.Lock()
         tasks: set[asyncio.Task] = set()
-
-        async def write_response(response):
-            if response is None:
-                return
-            async with write_lock:
-                stdout.write(json.dumps(response).encode("utf-8") + b"\n")
-                stdout.flush()
 
         async def handle_request(request: bytes):
             request_id = self._request_id_from_body(request)
@@ -1122,27 +1164,29 @@ class McpServer:
             # request in practice and stale reads only see the default version.
             if request_method == "initialize" and response is not None and "error" not in response:
                 self._stdio_protocol_version = active_protocol_version
-            await write_response(response)
+            if response is not None:
+                self._write_stdio_message(response)
 
-        while True:
-            try:
-                request = await asyncio.to_thread(stdin.readline)
-                if not request:  # EOF
+        with self._stdio_output_scope(stdout):
+            while True:
+                try:
+                    request = await asyncio.to_thread(stdin.readline)
+                    if not request:  # EOF
+                        break
+
+                    # Strip whitespace (trailing newline) before parsing
+                    request = request.strip()
+                    if not request:
+                        continue
+
+                    task = asyncio.create_task(handle_request(request))
+                    tasks.add(task)
+                    task.add_done_callback(tasks.discard)
+                except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
                     break
 
-                # Strip whitespace (trailing newline) before parsing
-                request = request.strip()
-                if not request:
-                    continue
-
-                task = asyncio.create_task(handle_request(request))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-            except (BrokenPipeError, KeyboardInterrupt):  # Client disconnected
-                break
-
-        if tasks:
-            await asyncio.gather(*tasks)
+            if tasks:
+                await asyncio.gather(*tasks)
 
     def _stdio_request_protocol(self, body: dict | bytes | bytearray) -> tuple[str | None, str]:
         try:
@@ -1269,9 +1313,19 @@ class McpServer:
                 "version": self.version,
             },
         }
+        if self.get_current_transport_session_id() == "stdio:default":
+            result["capabilities"]["logging"] = {}
         if self.instructions is not None:
             result["instructions"] = self.instructions
         return result
+
+    def _mcp_logging_set_level(self, level: str, _meta: dict | None = None) -> dict:
+        """MCP logging/setLevel method."""
+        if level not in _LOG_LEVELS:
+            raise JsonRpcException(-32602, f"Invalid params: unsupported logging level '{level}'")
+        with self._stdio_write_lock:
+            self._stdio_log_level = level
+        return {}
 
     def _mcp_tools_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
         """MCP tools/list method"""
