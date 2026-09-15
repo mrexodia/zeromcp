@@ -37,7 +37,8 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
-          version: "0.9.3"
+          # >=0.9.12 is required for `uv publish` to upload PEP 740 attestations.
+          version: "0.10.6"
 
       - name: Create venv
         run: uv sync
@@ -65,6 +66,14 @@ jobs:
           uv run coverage combine
           uv run coverage report
 
+      - name: Build distributions
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: uv build
+
+      - name: Attest distributions
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: astral-sh/attest-action@f589a42a7efb6fe400b4f400de60b4bc90390027 # v0.0.6
+
       - name: Publish
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        run: uv build && uv publish
+        run: uv publish
