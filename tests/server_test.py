@@ -12,6 +12,11 @@ from typing import BinaryIO, cast
 from urllib.parse import urlparse
 from zeromcp import McpAuthInfo, McpServer, McpHttpRequestHandler
 
+# The check/cross markers printed below are absent from some console code pages
+# (GBK, cp1252), where print() would raise UnicodeEncodeError.
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))

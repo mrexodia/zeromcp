@@ -3,12 +3,18 @@ Comprehensive JSON-RPC 2.0 test suite for MCP implementation
 """
 import asyncio
 import json
+import io
 import sys
 import traceback
 import re
 from typing import Optional, Any, TypedDict
 
 from zeromcp.jsonrpc import JsonRpcRegistry
+
+# The check/cross markers printed below are absent from some console code pages
+# (GBK, cp1252), where print() would raise UnicodeEncodeError.
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # Create registry and register test methods
 jsonrpc = JsonRpcRegistry()
