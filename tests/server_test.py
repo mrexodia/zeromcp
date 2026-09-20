@@ -5,6 +5,8 @@ import json
 import requests
 import sys
 import socket
+import threading
+import time
 import zlib
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -1589,6 +1591,181 @@ def test_stop_closes_idle_keep_alive_connection():
     print("✓ PASS")
 
 
+def wait_for_listener(port: int, timeout: float = 5) -> socket.socket:
+    """Connect once something listens on port, so a server bound on another thread is not raced."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=2)
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"nothing ever listened on port {port}")
+            time.sleep(0.05)
+
+
+def test_stop_while_single_threaded_server_has_an_idle_keep_alive_client():
+    print("Testing server stop with an idle keep-alive client and no server thread...")
+    port = find_free_port()
+    server = McpServer("test")
+    # background=False selects HTTPServer, which serves the connection in the thread running
+    # serve_forever() instead of a per-connection thread.
+    threading.Thread(
+        target=lambda: server.serve("127.0.0.1", port, background=False), daemon=True
+    ).start()
+    sock = wait_for_listener(port)
+    try:
+        body = json.dumps(PING_JSON).encode("utf-8")
+        request = (
+            f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+        ).encode() + body
+        sock.sendall(request)
+        status, _, _ = read_http_response(sock)
+        assert status.startswith(b"HTTP/1.1 200"), status
+
+        stopping = threading.Thread(target=server.stop, daemon=True)
+        started = time.monotonic()
+        stopping.start()
+        stopping.join(timeout=5)
+        elapsed = time.monotonic() - started
+        assert not stopping.is_alive(), (
+            f"stop() was still waiting {elapsed:.1f}s later; the idle handler only leaves"
+            f" its read after the {McpHttpRequestHandler.timeout}s socket timeout"
+        )
+        sock.settimeout(1)
+        assert sock.recv(1) == b"", "idle keep-alive connection stayed open after stop()"
+    finally:
+        sock.close()
+    print("✓ PASS")
+
+
+def status_lines(stream):
+    """Every status line in `stream`.
+
+    A keep-alive connection can deliver the next response straight after the previous body, with no
+    newline in between, so this scans for the marker instead of splitting the stream into lines.
+    """
+    found = []
+    at = 0
+    while (i := stream.find(b"HTTP/1.1 ", at)) != -1:
+        end = stream.find(b"\r\n", i)
+        found.append(stream[i:end if end != -1 else None])
+        at = i + 1
+    return found
+
+
+def read_status_lines(sock, count, timeout=5):
+    """Accumulate reads until `count` status lines have arrived.
+
+    A reader that stops at the end of the first response would discard the bytes of the second one
+    and then time out waiting for a reply that was already delivered.
+    """
+    deadline = time.monotonic() + timeout
+    stream = b""
+    while len(status_lines(stream)) < count:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sock.settimeout(remaining)
+        try:
+            chunk = sock.recv(4096)
+        except TimeoutError:
+            break
+        if not chunk:
+            break
+        stream += chunk
+    return status_lines(stream)
+
+
+def test_pipelined_requests_on_a_keep_alive_connection_are_answered():
+    print("Testing pipelined requests on a keep-alive connection...")
+    with run_server() as (base_url, _):
+        parsed = urlparse(base_url)
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        try:
+            body = json.dumps(PING_JSON).encode("utf-8")
+            request = (
+                f"POST /mcp HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+            # Neither response is read before both requests are sent, so the second request line
+            # can be sitting in the handler's buffered reader while it waits for more input.
+            sock.sendall(request * 2)
+            statuses = read_status_lines(sock, 2)
+            assert statuses == [b"HTTP/1.1 200 OK", b"HTTP/1.1 200 OK"], (
+                f"two pipelined requests got {statuses!r}"
+            )
+        finally:
+            sock.close()
+    print("✓ PASS")
+
+
+def test_idle_keep_alive_connection_still_answers_after_being_polled():
+    print("Testing an idle keep-alive connection still answers after being polled...")
+    with run_server() as (base_url, _):
+        parsed = urlparse(base_url)
+        sock = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+        try:
+            body = json.dumps(PING_JSON).encode("utf-8")
+            request = (
+                f"POST /mcp HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+            ).encode() + body
+            sock.sendall(request)
+            status, _, _ = read_http_response(sock)
+            assert status.startswith(b"HTTP/1.1 200"), status
+
+            time.sleep(1.5)  # ~6 rounds of the wait that peeks the handler's read buffer
+            sock.sendall(request)
+            again, _, _ = read_http_response(sock)
+            assert again.startswith(b"HTTP/1.1 200"), (
+                f"connection stopped working after sitting idle: {again!r}"
+            )
+        finally:
+            sock.close()
+    print("✓ PASS")
+
+
+class _QuietConnectionHandler(McpHttpRequestHandler):
+    """Short read timeout so a test can watch an idle connection being dropped."""
+
+    timeout = 1
+
+
+def test_quiet_keep_alive_connection_is_still_dropped_on_timeout():
+    print("Testing a quiet keep-alive connection is still dropped at the read timeout...")
+    port = find_free_port()
+    server = McpServer("test")
+    threading.Thread(
+        target=lambda: server.serve(
+            "127.0.0.1", port, background=True, request_handler=_QuietConnectionHandler
+        ),
+        daemon=True,
+    ).start()
+    sock = wait_for_listener(port)
+    try:
+        body = json.dumps(PING_JSON).encode("utf-8")
+        request = (
+            f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n"
+        ).encode() + body
+        sock.sendall(request)
+        status, _, _ = read_http_response(sock)
+        assert status.startswith(b"HTTP/1.1 200"), status
+
+        started = time.monotonic()
+        sock.settimeout(10)
+        assert sock.recv(1) == b"", "server never dropped the quiet connection"
+        elapsed = time.monotonic() - started
+        assert 0.9 <= elapsed < 3, (
+            f"quiet connection closed after {elapsed:.2f}s, expected ~{_QuietConnectionHandler.timeout}s"
+        )
+    finally:
+        sock.close()
+        server.stop()
+    print("✓ PASS")
+
+
 def test_exception_redaction():
     print("Testing exception redaction...")
     with run_server() as (base_url, server):
@@ -1758,6 +1935,10 @@ def run_all_tests():
         test_http11_requires_exactly_one_host()
         test_malformed_chunk_trailer_rejected()
         test_stop_closes_idle_keep_alive_connection()
+        test_stop_while_single_threaded_server_has_an_idle_keep_alive_client()
+        test_pipelined_requests_on_a_keep_alive_connection_are_answered()
+        test_idle_keep_alive_connection_still_answers_after_being_polled()
+        test_quiet_keep_alive_connection_is_still_dropped_on_timeout()
         test_exception_redaction()
         test_exception_exposure()
         test_http_errors()
