@@ -959,6 +959,7 @@ class McpServer:
         destructive: bool | None = None,
         idempotent: bool | None = None,
         open_world: bool | None = None,
+        additional_properties: bool = False,
     ) -> Callable:
         annotations = {}
         if read_only is not None:
@@ -975,6 +976,7 @@ class McpServer:
                 setattr(inner, "__mcp_tool_title__", title)
             if annotations:
                 setattr(inner, "__mcp_tool_annotations__", annotations)
+            setattr(inner, "__mcp_tool_additional_properties__", additional_properties)
             return self.tools.method(inner)
 
         return decorator if func is None else decorator(func)
@@ -1807,6 +1809,7 @@ class McpServer:
                 "type": "object",
                 "properties": properties,
                 "required": required,
+                "additionalProperties": getattr(func, "__mcp_tool_additional_properties__", False),
             },
         }
 

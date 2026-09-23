@@ -687,6 +687,56 @@ def test_tool_annotations():
     print("✓ PASS")
 
 
+def test_tool_additional_properties():
+    print("Testing tool input schema additionalProperties...")
+    server = McpServer("input-schema-test")
+
+    @server.tool
+    def default_tool(value: str) -> str:
+        return value
+
+    @server.tool()
+    def default_decorator_tool(value: str) -> str:
+        return value
+
+    @server.tool(additional_properties=False, read_only=True)
+    def named_arguments(options: dict[str, int], count: int = 1) -> int:
+        return sum(options.values()) * count
+
+    @server.tool(additional_properties=True)
+    async def explicit_additional_properties(value: str) -> str:
+        return value
+
+    def direct_tool(value: str) -> str:
+        return value
+
+    server.tool(direct_tool, additional_properties=True)
+
+    request = {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
+    for protocol_version in ("2025-03-26", "2025-06-18", "2025-11-25"):
+        with server._context_scope(protocol_version=protocol_version):
+            response = server._dispatch_mcp(request)
+        assert response is not None
+        tools = {tool["name"]: tool for tool in response["result"]["tools"]}
+        for name in ("default_tool", "default_decorator_tool"):
+            assert tools[name]["inputSchema"]["additionalProperties"] is False
+        for name in ("explicit_additional_properties", "direct_tool"):
+            assert tools[name]["inputSchema"]["additionalProperties"] is True
+        tool = tools["named_arguments"]
+        assert tool["inputSchema"] == {
+            "type": "object",
+            "properties": {
+                "options": {"type": "object", "additionalProperties": {"type": "integer"}},
+                "count": {"type": "integer", "default": 1},
+            },
+            "required": ["options"],
+            "additionalProperties": False,
+        }
+        assert tool["annotations"] == {"readOnlyHint": True}
+        assert "additionalProperties" not in tool["outputSchema"]
+    print("✓ PASS")
+
+
 def test_oauth_resource_server():
     print("Testing OAuth resource server support...")
     port = find_free_port()
@@ -1727,6 +1777,7 @@ def run_all_tests():
         test_sync_tool_can_bridge_to_async_in_sync_transport()
         test_request_context_meta_and_async_tool()
         test_tool_annotations()
+        test_tool_additional_properties()
         test_oauth_resource_server()
         test_list_cursor_params_are_accepted()
         test_resource_and_prompt_cancellation()
