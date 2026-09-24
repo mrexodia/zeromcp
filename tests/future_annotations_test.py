@@ -16,9 +16,17 @@ module level so its annotations really do go through postponed evaluation.
 """
 from __future__ import annotations
 
+import io
+import sys
+
 from typing import NotRequired, Required, TypedDict
 
 from zeromcp import McpServer
+
+# The check/cross markers printed below are absent from some console code pages
+# (GBK, cp1252), where print() would raise UnicodeEncodeError.
+if isinstance(sys.stdout, io.TextIOWrapper):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def _list_tool_schema(server: McpServer, tool_name: str) -> dict:
