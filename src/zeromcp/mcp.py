@@ -1,4 +1,5 @@
 import re
+import select
 import socket
 import sys
 import time
@@ -34,6 +35,8 @@ _HTTP_TOKEN_BYTES = b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefg
 _MAX_CHUNK_LINE = 8192
 _MAX_TRAILER_BYTES = 64 * 1024
 _LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
+# How long a handler waits between the socket checks that let it notice `stop()`.
+_IDLE_POLL_SECONDS = 0.25
 
 @dataclass(frozen=True)
 class McpAuthInfo:
@@ -328,10 +331,54 @@ class McpHttpRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_one_request(self) -> None:
+        if not self._request_line_arrives():
+            self.close_connection = True
+            return
+
         # handle_expect_100() runs during request parsing. Keep any successful
         # authentication result scoped to this request so do_POST() can reuse it.
         self._expect_auth: tuple[str, McpAuthInfo | None] | None = None
         super().handle_one_request()
+
+    def _request_line_arrives(self) -> bool:
+        """Wait for the start of a request line, giving up once the server is stopping.
+
+        `stop()` shuts idle keep-alive sockets down, but on Windows that does not interrupt a
+        handler already blocked in `recv()`, so `stop()` would wait out the full `timeout`. Waiting
+        in slices bounded by the server's running flag lets the handler notice the stop itself, and
+        keeps the same overall bound on a connection that goes quiet.
+
+        Polling the socket is not enough on its own: a pipelined client's next request can already
+        be sitting in the buffered reader, where `select()` cannot see it. Ask the buffer first,
+        with the socket non-blocking so that the check itself cannot block -- `peek()` fills from
+        the socket, so on a blocking socket it would wait here for exactly as long as we are
+        trying not to.
+        """
+        deadline = time.monotonic() + self.timeout
+        self.connection.setblocking(False)
+        try:
+            while self.mcp_server._running:
+                if self._request_bytes_are_buffered():
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                if select.select([self.connection], [], [], min(remaining, _IDLE_POLL_SECONDS))[0]:
+                    return True
+        finally:
+            self.connection.setblocking(True)
+        return False
+
+    def _request_bytes_are_buffered(self) -> bool:
+        """Report whether the read buffer already holds bytes, without touching the socket."""
+        try:
+            # rfile is the BufferedReader from `connection.makefile("rb", -1)`; the declared
+            # type BufferedIOBase has no peek().
+            return bool(self.rfile.peek(1))  # type: ignore
+        except (BlockingIOError, OSError, ValueError):
+            # Nothing buffered and nothing readable yet (or the connection is gone), so the
+            # socket check below decides. An idle socket then exits via `_running` or `deadline`.
+            return False
 
     def handle(self):
         """Override to add error handling for connection errors"""
