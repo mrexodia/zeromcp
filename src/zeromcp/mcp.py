@@ -1494,7 +1494,7 @@ class McpServer:
     def _enumerate_resources(self):
         for name, func in self.resources.methods.items():
             uri: str = getattr(func, "__resource_uri__")
-            description = (func.__doc__ or f"Read {uri}").strip()
+            description = inspect.cleandoc(func.__doc__ or f"Read {uri}").strip()
             yield uri, name, description
 
     def _mcp_resources_list(self, cursor: str | None = None, _meta: dict | None = None) -> dict:
@@ -1638,7 +1638,7 @@ class McpServer:
 
         schema: dict[str, Any] = {
             "name": func_name,
-            "description": (func.__doc__ or f"Prompt {func_name}").strip(),
+            "description": (inspect.cleandoc(func.__doc__ or f"Prompt {func_name}")).strip(),
         }
 
         if arguments:
@@ -1802,7 +1802,7 @@ class McpServer:
 
         schema: dict[str, Any] = {
             "name": func_name,
-            "description": (func.__doc__ or f"Call {func_name}").strip(),
+            "description": inspect.cleandoc(func.__doc__ or f"Call {func_name}").strip(),
             "inputSchema": {
                 "type": "object",
                 "properties": properties,
